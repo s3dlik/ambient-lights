@@ -81,46 +81,122 @@ export class Link extends EventTarget {
 // Web Bluetooth (Chrome/Edge on desktop & Android, Bluefy on iPhone)
 // ---------------------------------------------------------------------------
 
+/** Full 128-bit form of a 16-bit Bluetooth UUID. Some iOS Web Bluetooth browsers (Bluefy) reject bare numbers. */
+export const uuid128 = (n) => `0000${n.toString(16).padStart(4, '0')}-0000-1000-8000-00805f9b34fb`;
+
+/** Describe any thrown value (DOMException, Error, string, number…) for the diagnostics panel. */
+export function describeError(e) {
+  if (e == null) return String(e);
+  if (typeof e === 'string') return e;
+  if (typeof e !== 'object') return `bare ${typeof e} ${String(e)} (no error object; a native error code from the browser)`;
+  const parts = [e.name, e.message, e.code !== undefined && e.code !== 0 ? `code ${e.code}` : null].filter(Boolean);
+  return parts.length ? parts.join(' · ') : (() => { try { return JSON.stringify(e); } catch { return String(e); } })();
+}
+
+/** Error that remembers which connection step failed. */
+export class ConnectError extends Error {
+  constructor(step, cause, extra = '') {
+    super(`${step}: ${describeError(cause)}`);
+    this.name = cause?.name === 'NotFoundError' ? 'NotFoundError' : 'ConnectError';
+    this.step = step;
+    this.causeText = describeError(cause);
+    this.extra = extra;
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 export class WebBluetoothTransport {
   static get available() { return typeof navigator !== 'undefined' && !!navigator.bluetooth; }
 
-  constructor({ namePrefix = '', showAll = false } = {}) {
+  constructor({ namePrefix = '', showAll = false, onStep = () => {} } = {}) {
     this.namePrefix = namePrefix.trim();
     this.showAll = showAll;
+    this.onStep = onStep;
     this.device = null;
     this.writeChar = null;
     this.notifyChar = null;
     this.onData = () => {};
     this.onDisconnect = () => {};
-    this._onNotify = (e) => this.onData(new Uint8Array(e.target.value.buffer));
+    this._onNotify = (e) => {
+      const v = e.target.value;
+      this.onData(new Uint8Array(v.buffer, v.byteOffset, v.byteLength));
+    };
     this._onGone = () => this.onDisconnect();
   }
 
   get connected() { return !!this.device?.gatt?.connected; }
   get name() { return this.device?.name || 'Controller'; }
 
+  async step(name, fn) {
+    this.onStep(name);
+    try { return await fn(); } catch (e) {
+      if (e instanceof ConnectError) throw e;
+      throw new ConnectError(name, e);
+    }
+  }
+
   async connect() {
+    const service128 = uuid128(UUID.service);
     if (!this.device) {
-      const optionalServices = [UUID.service];
+      const optionalServices = [service128, ...UUID.advertised.map(uuid128)];
       const options = this.showAll
         ? { acceptAllDevices: true, optionalServices }
         : {
           filters: [
             ...(this.namePrefix ? [{ namePrefix: this.namePrefix }] : []),
-            { services: [UUID.service] },
-            ...UUID.advertised.map((s) => ({ services: [s] })),
+            { services: [service128] },
+            ...UUID.advertised.map((s) => ({ services: [uuid128(s)] })),
           ],
           optionalServices,
         };
-      this.device = await navigator.bluetooth.requestDevice(options);
+      this.device = await this.step('choose device', () => navigator.bluetooth.requestDevice(options));
       this.device.addEventListener('gattserverdisconnected', this._onGone);
     }
-    const server = await this.device.gatt.connect();
-    const service = await server.getPrimaryService(UUID.service);
-    this.notifyChar = await service.getCharacteristic(UUID.notify);
-    this.writeChar = await service.getCharacteristic(UUID.write);
+
+    // iOS frequently fails the first GATT connect to these JDY-style modules: retry a few times
+    const server = await this.step('connect (GATT)', async () => {
+      let last;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try { return await this.device.gatt.connect(); } catch (e) {
+          last = e;
+          this.onStep(`connect (GATT) attempt ${attempt} failed: ${describeError(e)}`);
+          try { this.device.gatt.disconnect(); } catch { /* ignore */ }
+          await sleep(600 * attempt);
+        }
+      }
+      throw last;
+    });
+
+    let service;
+    try {
+      service = await this.step('open service FFE0', () => server.getPrimaryService(service128));
+    } catch (e) {
+      throw new ConnectError(e.step, e.causeText, await this.listServices(server));
+    }
+    try {
+      this.notifyChar = await this.step('find notify FFE1', () => service.getCharacteristic(uuid128(UUID.notify)));
+      this.writeChar = await this.step('find write FFE2', () => service.getCharacteristic(uuid128(UUID.write)));
+    } catch (e) {
+      throw new ConnectError(e.step, e.causeText, await this.listCharacteristics(service));
+    }
     this.notifyChar.addEventListener('characteristicvaluechanged', this._onNotify);
-    await this.notifyChar.startNotifications();
+    await this.step('start notifications', () => this.notifyChar.startNotifications());
+  }
+
+  async listServices(server) {
+    try {
+      const all = await server.getPrimaryServices();
+      return 'services on the box: ' + (all.map((s) => s.uuid).join(', ') || 'none visible');
+    } catch (e) { return `could not list services (${describeError(e)})`; }
+  }
+
+  async listCharacteristics(service) {
+    try {
+      const all = await service.getCharacteristics();
+      const props = (p) => Object.entries({ read: p.read, write: p.write, writeNR: p.writeWithoutResponse, notify: p.notify, indicate: p.indicate }).filter(([, v]) => v).map(([k]) => k).join('/');
+      return 'characteristics in FFE0: ' + (all.map((c) => `${c.uuid} [${props(c.properties || {})}]`).join(', ') || 'none visible');
+    } catch (e) { return `could not list characteristics (${describeError(e)})`; }
   }
 
   async write(bytes) {

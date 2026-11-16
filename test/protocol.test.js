@@ -1,7 +1,22 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Cmd, encodeFrame, parseFrame, FrameBuffer, OTA_PREFIXES, BLOCKED_PREFIXES, FIRMWARE_NAME_QUERY } from '../js/protocol.js';
-import { DemoTransport, Link } from '../js/transport.js';
+import { DemoTransport, Link, uuid128, describeError, ConnectError } from '../js/transport.js';
+
+test('Bluetooth UUIDs are passed in full 128-bit form', () => {
+  assert.equal(uuid128(0xffe0), '0000ffe0-0000-1000-8000-00805f9b34fb');
+  assert.equal(uuid128(0xaf30), '0000af30-0000-1000-8000-00805f9b34fb');
+});
+
+test('connection errors stay readable whatever the browser throws', () => {
+  assert.match(describeError(2), /bare number 2/);
+  assert.equal(describeError('boom'), 'boom');
+  assert.equal(describeError(Object.assign(new Error('GATT fail'), { name: 'NetworkError' })), 'NetworkError · GATT fail');
+  const ce = new ConnectError('choose device', 2);
+  assert.equal(ce.step, 'choose device');
+  assert.match(ce.message, /choose device: bare number 2/);
+  assert.equal(new ConnectError('choose device', Object.assign(new Error('x'), { name: 'NotFoundError' })).name, 'NotFoundError');
+});
 
 const ascii = (u8) => String.fromCharCode(...u8);
 

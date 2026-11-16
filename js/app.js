@@ -2,7 +2,7 @@ import {
   Cmd, PALETTE, PALETTE_EMPTY, RGB_MODES, flowModesFor, COMMON_EFFECTS, WELCOME_MODES, WARN_COLORS,
   parseFrame, BLOCKED_PREFIXES, OTA_PREFIXES, FIRMWARE_NAME_QUERY,
 } from './protocol.js';
-import { Link, WebBluetoothTransport, DemoTransport } from './transport.js';
+import { Link, WebBluetoothTransport, DemoTransport, describeError } from './transport.js';
 
 // ---------------------------------------------------------------------------
 // tiny DOM + state helpers
@@ -131,29 +131,37 @@ link.addEventListener('state', (e) => {
 
 async function connect({ demo = false, reuse = false } = {}) {
   if (state.connecting) return;
-  set({ connecting: true });
+  const steps = [];
+  const stamp = () => new Date().toTimeString().slice(0, 8);
+  const onStep = (s) => { steps.push(`${stamp()} ${s}`); set({ connectDiag: { ok: null, steps: [...steps] } }); };
+  set({ connecting: true, connectDiag: null });
   renderShell();
   try {
     let transport;
-    if (reuse && lastTransport) transport = lastTransport;
+    if (reuse && lastTransport) { transport = lastTransport; transport.onStep = onStep; }
     else if (demo) transport = new DemoTransport();
     else {
       const prefix = $('#prefix')?.value ?? store.get('prefix', 'ATW');
       const showAll = $('#show-all')?.checked ?? false;
       store.set('prefix', prefix);
       store.set('showAll', showAll);
-      transport = new WebBluetoothTransport({ namePrefix: prefix, showAll });
+      onStep(`start · prefix "${prefix}" · show all ${showAll ? 'on' : 'off'} · ${navigator.userAgent}`);
+      transport = new WebBluetoothTransport({ namePrefix: prefix, showAll, onStep });
     }
     state.demo = transport instanceof DemoTransport;
     await link.connect(transport);
     lastTransport = transport;
     addLog('dim', `Connected to ${transport.name}`);
+    if (steps.length) set({ connectDiag: null });
   } catch (e) {
-    set({ connecting: false });
+    const msg = describeError(e);
+    if (e?.extra) steps.push(`${stamp()} ${e.extra}`);
+    steps.push(`${stamp()} FAILED at ${e?.step || 'unknown step'}: ${e?.causeText || msg}`);
+    set({ connecting: false, connectDiag: { ok: false, steps } });
     renderShell();
     if (e?.name === 'NotFoundError') toast('No device chosen');
-    else toast(`Connection failed: ${e?.message || e}`, 5000);
-    addLog('err', `Connect failed: ${e?.message || e}`);
+    else toast(`Connection failed at ${e?.step || 'connect'}: ${e?.causeText || msg}`, 6000);
+    addLog('err', `Connect failed: ${msg}`);
   }
 }
 
@@ -438,6 +446,19 @@ function buildConnect() {
   const connectBtn = h('button', { class: 'btn primary block', type: 'button', onclick: () => connect() }, 'Connect to controller');
   const reconnectBtn = h('button', { class: 'btn block', type: 'button', onclick: () => connect({ reuse: true }) }, 'Reconnect');
   const demoBtn = h('button', { class: 'btn ghost block', type: 'button', onclick: () => connect({ demo: true }) }, 'Try the demo (no car needed)');
+  const diagPre = h('pre', { class: 'log', style: { 'max-height': '220px', 'white-space': 'pre-wrap' } });
+  const diagCard = h('div', { class: 'card' },
+    h('h3', { style: { 'margin-top': 0 } }, 'Connection details'),
+    h('p', { class: 'hint' }, 'If connecting fails, copy this and send it over. It shows which step failed.'),
+    diagPre,
+    h('div', { class: 'row', style: { 'margin-top': '8px' } },
+      h('button', { class: 'btn small', type: 'button', onclick: () => copyText((state.connectDiag?.steps || []).join('\n')) }, 'Copy details')),
+    h('p', { class: 'hint' }, 'Tips: swipe the official app away in the app switcher (it keeps the connection in the background). Then turn Bluetooth off and on. If the box isn’t listed, tick “Show all Bluetooth devices”.'));
+  bind(() => {
+    const d = state.connectDiag;
+    diagCard.hidden = !d || !d.steps?.length;
+    diagPre.textContent = (d?.steps || []).join('\n');
+  });
   const noBt = h('div', { class: 'banner info' },
     'This browser has no Web Bluetooth. On iPhone, open this page in the free ', h('b', {}, 'Bluefy'),
     ' browser. On a computer or Android phone, use Chrome or Edge.');
@@ -452,6 +473,7 @@ function buildConnect() {
       h('div', { style: { height: '6px' } }),
       connectBtn, h('div', { style: { height: '8px' } }), reconnectBtn, h('div', { style: { height: '8px' } }), demoBtn,
       h('p', { class: 'hint' }, 'Your box is called something like ATW-FWD-65E1. Close the official app first — the box accepts only one connection.')),
+    diagCard,
   );
   bind(() => {
     noBt.hidden = WebBluetoothTransport.available;
