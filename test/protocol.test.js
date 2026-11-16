@@ -1,6 +1,129 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Cmd, encodeFrame, parseFrame, FrameBuffer, OTA_PREFIXES, BLOCKED_PREFIXES, FIRMWARE_NAME_QUERY } from '../js/protocol.js';
+import {
+  Cmd, encodeFrame, parseFrame, FrameBuffer, OTA_PREFIXES, BLOCKED_PREFIXES, FIRMWARE_NAME_QUERY,
+  inspectFirmware, otaBlocks, otaLengthPayload, KNOWN_FIRMWARE,
+} from '../js/protocol.js';
+import { existsSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+
+/** Build a small fake vendor file with the real layout: 256-byte header block, then XOR 0x33 body (vector table at 512). */
+function fakeFirmware({ name = 'File999.bin', size = 6000 } = {}) {
+  const f = new Uint8Array(size);
+  f.set([0xbe, 0xef, 0xe9, 0x91]);
+  const text = 'bin: N32G452x_App.bin\r\ncarname: TEST\r\nmcu: DEV_MCU_ANT\r\ncustomer: Common\r\nsubcustomer: Common\r\nfirmware: Unknown\r\n';
+  f.set(Buffer.from(text, 'latin1'), 4);
+  for (let i = 4 + text.length; i < 512; i++) f[i] = (i * 73) & 0xff;
+  const img = new Uint8Array(size - 512);
+  new DataView(img.buffer).setUint32(0, 0x200083f0, true);
+  new DataView(img.buffer).setUint32(4, 0x080061ad, true);
+  img.set(Buffer.from(`xx<1501${name}>yyV6.30zz2026-11-15-007`, 'latin1'), 64);
+  for (let i = 0; i < img.length; i++) f[512 + i] = img[i] ^ 0x33;
+  return f;
+}
+
+test('firmware file inspector accepts the vendor layout and rejects garbage', () => {
+  const ok = inspectFirmware(fakeFirmware());
+  assert.equal(ok.ok, true, ok.errors.join('; '));
+  assert.equal(ok.info.text.bin, 'N32G452x_App.bin');
+  assert.equal(ok.info.embeddedName, 'File999.bin');
+  assert.equal(ok.info.build, 'V6.30 2026-11-15-007');
+  assert.equal(ok.info.sp, 0x200083f0);
+  const bad = fakeFirmware(); bad[0] = 0;
+  assert.equal(inspectFirmware(bad).ok, false);
+  const noVec = fakeFirmware(); noVec[512] ^= 0xff; noVec[515] ^= 0xff;
+  assert.equal(inspectFirmware(noVec).ok, false);
+  assert.equal(inspectFirmware(new Uint8Array(100)).ok, false);
+});
+
+test('real File122 (if present locally) passes the checks and is recognised', { skip: !existsSync('firmware/server_File122_V6.30_2026-11-15_original.bin') }, () => {
+  const f = new Uint8Array(readFileSync('firmware/server_File122_V6.30_2026-11-15_original.bin'));
+  const r = inspectFirmware(f);
+  assert.equal(r.ok, true, r.errors.join('; '));
+  assert.equal(r.info.embeddedName, 'File122.bin');
+  assert.equal(r.info.reset, 0x080061ad);
+  assert.ok(KNOWN_FIRMWARE[createHash('sha256').update(f).digest('hex')]);
+  assert.equal(otaLengthPayload(f.length), '0E231636');
+  assert.equal(otaBlocks(f).length, 1159);
+});
+
+test('OTA payloads are built exactly like the vendor app', () => {
+  assert.equal(otaLengthPayload(80044), '0E080044');
+  assert.throws(() => otaLengthPayload(0));
+  assert.throws(() => otaLengthPayload(1e6));
+  const blocks = otaBlocks(new Uint8Array(450));
+  assert.deepEqual(blocks.map((b) => b.length), [200, 200, 50]);
+});
+
+test('a running update locks out normal commands', async () => {
+  const link = new Link();
+  const sent = [];
+  link.addEventListener('tx', (e) => sent.push(e.detail.payload));
+  await link.connect(new DemoTransport());
+  link.otaLock = true;
+  assert.equal(link.send(Cmd.power(0)), false);
+  assert.equal(link.send('0A01', { ota: true }), true);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(sent, ['0A01']);
+  await link.disconnect();
+});
+
+test('demo box interrupted mid-update stays silent until the update request is repeated', async () => {
+  const frames = [];
+  const link = new Link();
+  link.gapMs = 1;
+  link.addEventListener('frame', (e) => frames.push(parseFrame(e.detail.payload)));
+  await link.connect(new DemoTransport());
+  link.send(otaLengthPayload(5000), { ota: true });
+  await new Promise((r) => setTimeout(r, 900));
+  assert.ok(frames.some((f) => f.type === 'otaStart'));
+  await link.sendRaw(new Uint8Array(200));
+  await link.disconnect(); // interrupted
+  frames.length = 0;
+  await link.connect(new DemoTransport()); // "power-cycled" box, still in update mode
+  link.send(FIRMWARE_NAME_QUERY, { ota: true });
+  link.send('0A01', { ota: true });
+  await new Promise((r) => setTimeout(r, 400));
+  assert.deepEqual(frames, [], 'no answers while waiting in update mode');
+  link.send(otaLengthPayload(5000), { ota: true });
+  await new Promise((r) => setTimeout(r, 600));
+  assert.ok(frames.some((f) => f.type === 'otaStart'), 'asks for block 1 again');
+  await link.disconnect();
+  DemoTransport.stuckInUpdate = false;
+});
+
+test('full simulated update through the demo bootloader', async () => {
+  const link = new Link();
+  link.gapMs = 1;
+  const frames = [];
+  link.addEventListener('frame', (e) => frames.push(parseFrame(e.detail.payload)));
+  const demo = new DemoTransport();
+  await link.connect(demo);
+  const file = fakeFirmware({ size: 1050 }); // 6 blocks: 5 x 200 + 50
+  const blocks = otaBlocks(file);
+  const waitFor = async (pred, ms = 3000) => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) { const f = frames.find(pred); if (f) return f; await new Promise((r) => setTimeout(r, 10)); }
+    throw new Error('timeout');
+  };
+  link.otaLock = true;
+  link.send(otaLengthPayload(file.length), { ota: true });
+  await waitFor((f) => f.type === 'otaStart');
+  for (let i = 0; i < blocks.length; i++) {
+    const before = frames.filter((f) => f.type === 'otaNext').length;
+    assert.equal(await link.sendRaw(blocks[i], { pieceSize: i % 2 ? 20 : 0 }), true);
+    if (i < blocks.length - 1) await waitFor(() => frames.filter((f) => f.type === 'otaNext').length > before);
+  }
+  link.send('0A01', { ota: true });
+  const v = await waitFor((f) => f.type === 'version');
+  assert.equal(v.software, '261115-007');
+  // same length again -> the box refuses with <1502>
+  frames.length = 0;
+  link.send(otaLengthPayload(file.length), { ota: true });
+  const r = await waitFor((f) => f.raw === '1502');
+  assert.equal(r.type, 'firmwareName');
+  await link.disconnect();
+});
 import { DemoTransport, Link, uuid128, describeError, ConnectError } from '../js/transport.js';
 
 test('Bluetooth UUIDs are passed in full 128-bit form', () => {

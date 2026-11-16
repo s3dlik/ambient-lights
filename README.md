@@ -56,7 +56,7 @@ Improvements over the official app:
 - Scenes are saved on the phone.
 - The installer menu shows a backup of your values before you change anything.
 - Changes are written only after a confirmation that lists old → new values.
-- Firmware update is removed, so nothing can be downloaded or flashed.
+- Firmware update is opt-in and heavily guarded (Device → Firmware update). The app never downloads anything: you pick the file yourself. It checks the file and refuses unless the box reports the same file name, and nothing else is sent while it runs.
 
 ## Installer settings ("Factory Setting", PIN 1688 in the official app)
 
@@ -66,7 +66,14 @@ Reading them is safe. To change anything, tick **Allow changes**; each write the
 - **Light bar layout.** LED count per strip and the end where the cable enters. Your box: driver side 20 (right out), passenger side 114 (left out), front doors 60, rear doors 65, all doors "front out".
 - **Test / door swap.** These are the vendor's wiring-check and door-colour reorder tools.
 
-Deliberately **not** included: firmware (OTA) update, key learning, light-parameter import, customer-code import and "original car lights" flashing. The raw console also blocks those commands.
+Deliberately **not** included: key learning, light-parameter import, customer-code import and "original car lights" flashing. The raw console blocks those commands and the firmware-update opcodes (`0D`/`0E`).
+
+## Firmware update (experimental)
+
+Device → **Firmware update** uses the same procedure as the vendor app (see `carlight-protocol.md` §7). The vendor's bootloader could not be inspected, so treat it as risky:
+- Use only the vendor file for your box's exact name. Device → Firmware file name shows the name; the file has to be downloaded on a computer and copied to the phone.
+- Car parked, ignition on (engine running is best), phone charged, page kept in the foreground. iOS pauses background pages, which would stall the transfer.
+- If it's interrupted, follow the vendor's recovery procedure: switch the car off, cut the control box's main power for about a minute (its power connector or fuse), reconnect, and tap "Retry from the start". The vendor's answer was "Update", meaning the box stays in update mode until a complete update has been installed. The app first asks for the file name. If there's no answer, it sends the update request directly and starts again from block 1.
 
 ## Not yet verified on the real box
 

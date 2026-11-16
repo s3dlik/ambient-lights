@@ -15,6 +15,8 @@ export class Link extends EventTarget {
     this.busy = false;
     this.gapMs = 35;
     this.frames = new FrameBuffer();
+    /** While true (firmware update running), only payloads sent with `{ ota: true }` and raw blocks go out. */
+    this.otaLock = false;
   }
 
   get connected() { return !!this.transport?.connected; }
@@ -44,8 +46,9 @@ export class Link extends EventTarget {
   }
 
   /** Queue a command payload (hex string without < >). */
-  send(payload, { key } = {}) {
+  send(payload, { key, ota = false } = {}) {
     if (!this.connected) return false;
+    if (this.otaLock && !ota) return false;
     if (key) {
       const pending = this.queue.find((q) => q.key === key);
       if (pending) { pending.payload = payload; return true; }
@@ -55,20 +58,49 @@ export class Link extends EventTarget {
     return true;
   }
 
+  /**
+   * Queue raw bytes (no '<' '>' framing): used only for firmware blocks.
+   * pieceSize > 0 splits the block into several writes (for phones whose BLE MTU is below the block size).
+   * Resolves to true when every piece was written, false on a write error (nothing retried here).
+   */
+  sendRaw(bytes, { pieceSize = 0 } = {}) {
+    if (!this.connected) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      this.queue.push({ raw: bytes, pieceSize, resolve });
+      this.pump();
+    });
+  }
+
   async pump() {
     if (this.busy) return;
     this.busy = true;
     try {
       while (this.queue.length && this.connected) {
-        const { payload } = this.queue.shift();
-        this.emit('tx', { payload });
-        try {
-          await this.transport.write(encodeFrame(payload));
-        } catch (e) {
-          this.emit('error', { message: `Write failed: ${e.message || e}` });
+        const item = this.queue.shift();
+        if (item.raw) {
+          const { raw, pieceSize, resolve } = item;
+          const step = pieceSize > 0 ? pieceSize : raw.length;
+          let ok = true;
+          try {
+            for (let i = 0; i < raw.length; i += step) await this.transport.write(raw.subarray(i, Math.min(raw.length, i + step)));
+          } catch (e) {
+            ok = false;
+            this.emit('error', { message: `Firmware block write failed: ${e.message || e}` });
+          }
+          this.emit('tx-raw', { length: raw.length, ok });
+          resolve(ok);
+        } else {
+          const { payload } = item;
+          this.emit('tx', { payload });
+          try {
+            await this.transport.write(encodeFrame(payload));
+          } catch (e) {
+            this.emit('error', { message: `Write failed: ${e.message || e}` });
+          }
         }
         await new Promise((r) => setTimeout(r, this.gapMs));
       }
+      for (const item of this.queue.splice(0)) item.resolve?.(false); // disconnected: fail pending raw writes
     } finally {
       this.busy = false;
     }
@@ -239,11 +271,26 @@ export class DemoTransport {
     };
   }
 
-  async connect() { await wait(400); this.connected = true; }
-  async disconnect() { this.connected = false; this.onDisconnect(); }
+  async connect() {
+    await wait(400);
+    this.connected = true;
+    // a demo box whose update was interrupted stays in update mode: silent until it gets <0E…> again
+    if (DemoTransport.stuckInUpdate) { this.boot = { awaiting: true }; DemoTransport.stuckInUpdate = false; }
+  }
+  async disconnect() {
+    if (this.boot) DemoTransport.stuckInUpdate = true; // interrupted mid-update
+    this.connected = false;
+    this.onDisconnect();
+  }
 
   async write(bytes) {
     if (!this.connected) throw new Error('not connected');
+    if (this.boot?.awaiting) { // bootloader waiting for a new update request; ignores everything else
+      const m = String.fromCharCode(...bytes).match(/^<0E(\d{6})>$/i);
+      if (m) { this.boot = { expected: parseInt(m[1], 10), got: 0, inBlock: 0 }; setTimeout(() => this.reply('14'), 300); }
+      return;
+    }
+    if (this.boot) { this.bootReceive(bytes); return; } // simulated bootloader takes raw bytes
     const text = String.fromCharCode(...bytes);
     const payload = text.replace(/^<|>$/g, '');
     await wait(5);
@@ -251,6 +298,7 @@ export class DemoTransport {
   }
 
   reply(hex) {
+    if (!this.connected) return; // a disconnected box can't notify
     // the real box sometimes splits frames over several notifications – mimic that
     const text = `<${hex}>`;
     for (let i = 0; i < text.length; i += 20) {
@@ -273,7 +321,29 @@ export class DemoTransport {
     return bytesToHex([0x27, ...pack(s.rgbSlots), s.rgbCustom, ...pack(s.flowSlots), s.flowCustom, s.len, s.interval, 0, s.rgbSpeed, s.toggle]);
   }
   versionHex() {
-    return '13' + bytesToHex(Array.from('V6.303229-B6 260506-006', (c) => c.charCodeAt(0)));
+    return '13' + bytesToHex(Array.from('V6.303229-B6 ' + (this.software || '260506-006'), (c) => c.charCodeAt(0)));
+  }
+
+  // --- simulated firmware update (mirrors the vendor flow; the real bootloader is not available to study) ---
+  otaLength(len) {
+    if (len === this.lastOtaLength) { this.reply('1502'); return; } // same length as last update: refused
+    setTimeout(() => { // "reset into bootloader", then ask for block 0
+      this.boot = { expected: len, got: 0, inBlock: 0 };
+      this.reply('14');
+    }, 700);
+  }
+
+  bootReceive(bytes) {
+    const b = this.boot;
+    b.got += bytes.length;
+    b.inBlock += bytes.length;
+    if (b.got >= b.expected) {
+      this.lastOtaLength = b.expected;
+      this.boot = null;
+      this.software = '261115-007'; // pretend the new build is running after the reboot
+      return;
+    }
+    if (b.inBlock >= 200) { b.inBlock -= 200; setTimeout(() => this.reply('16'), 20); }
   }
   lampsHex() {
     const l = this.s.lamps;
@@ -292,7 +362,8 @@ export class DemoTransport {
       return;
     }
     // firmware-name query: the real box answers in plain ASCII, not hex (first step of the vendor update)
-    if (p.toUpperCase() === '0DBB44') { this.reply('1501File000-DEMO.bin'); return; }
+    if (p.toUpperCase() === '0DBB44') { this.reply(`1501${this.otaName || 'File000-DEMO.bin'}`); return; }
+    if (op === '0E' && /^0E\d{6}$/i.test(p)) { this.otaLength(parseInt(p.slice(2), 10)); return; }
     if (sub === '2101') { this.factory = true; this.reply('23' + s.dialModel + s.dialFunction); this.reply(this.lampsHex()); this.reply('25000000012300'); return; }
     if (sub === '2100') { this.factory = false; return; }
 
@@ -342,6 +413,9 @@ export class DemoTransport {
     }
   }
 }
+
+/** Survives reconnects in the demo, like a real box that is still waiting in its bootloader. */
+DemoTransport.stuckInUpdate = false;
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 export { hexToBytes };

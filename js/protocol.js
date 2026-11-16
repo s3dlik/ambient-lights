@@ -145,6 +145,91 @@ export const OTA_PREFIXES = ['0D', '0E'];
  */
 export const FIRMWARE_NAME_QUERY = '0DBB44';
 
+// ---------- firmware update (OTA) ----------
+//
+// Procedure, as implemented by the vendor app (FactoryActivity / WLSAPI, carLight 1.81.3):
+//   1. <0DBB44>                      -> box replies <15xx…name…> (plain ASCII) or <1502> = "update not supported"
+//   2. file = hex-decoded JSON "result" from the vendor server, sent byte-for-byte (header + XOR body, nothing decoded)
+//   3. <0E%06d(file length)>         -> box stores length + flag 0x55AA44BB and resets into its bootloader
+//                                       (box answers <1502> instead if the length equals the last update's length)
+//   4. bootloader replies <14>       -> send block 0; every <16> -> next block
+//      blocks = 200 raw bytes (last one shorter), one GATT write each, write-without-response, no framing/checksum
+//   5. no completion message: the vendor app just closes its progress dialog after the last block.
+
+export const OTA_BLOCK = 200;
+
+/** `<0E%06d>`: the step that resets the box into its bootloader. Deliberately NOT part of `Cmd`. */
+export function otaLengthPayload(length) {
+  if (!Number.isInteger(length) || length <= 0 || length > 999999) throw new Error(`bad firmware length ${length}`);
+  return '0E' + String(length).padStart(6, '0');
+}
+
+/** Split a firmware file into the 200-byte blocks the bootloader expects. */
+export function otaBlocks(file, size = OTA_BLOCK) {
+  const out = [];
+  for (let i = 0; i < file.length; i += size) out.push(file.subarray(i, Math.min(file.length, i + size)));
+  return out;
+}
+
+/** SHA-256 of vendor files we have checked byte-for-byte (see firmware/README.md). */
+export const KNOWN_FIRMWARE = {
+  '3e7821d56bc890b38a5fae0de27db4081ecde21400918b0572c993589bb99235': 'File122.bin · V6.30 · 2026-11-15 (vendor original, N32G452)',
+  'cc8577815f8927849aec8a9e9dbeba123abbef8e53cee18752096d088381c7b3': 'File004.bin · V3.00 (vendor original from the APK, gen 0)',
+  '242a1ffc98036a15676ede90df4b98444250310ba969a5bf21e60e60cf9a30d5': 'File006.bin · V3.20 (vendor original, gen 0)',
+};
+
+/**
+ * Inspect a vendor firmware file (as downloaded) without changing it.
+ * Layout: 256-byte header block (plain text + opaque 128-byte block), then XOR 0x33 body whose
+ * last 256 image bytes come first, so the Cortex-M vector table sits at file offset 512.
+ */
+export function inspectFirmware(file) {
+  const errors = [];
+  const warnings = [];
+  const info = { size: file?.length ?? 0 };
+  if (!(file instanceof Uint8Array) || file.length < 4096) {
+    errors.push('File is too small to be controller firmware.');
+    return { ok: false, errors, warnings, info };
+  }
+  const magic = (file[0] << 24 | file[1] << 16 | file[2] << 8 | file[3]) >>> 0;
+  if (magic !== 0xbeefe991) errors.push('Missing vendor header (expected BE EF E9 91 at the start).');
+
+  // text header: "key: value\r\n" lines up to and including the "firmware:" line
+  const head = String.fromCharCode(...file.subarray(4, 256));
+  const fwLine = head.indexOf('firmware:');
+  const textEnd = fwLine >= 0 ? head.indexOf('\r\n', fwLine) : -1;
+  if (textEnd < 0) errors.push('Header text not found.');
+  else {
+    info.text = {};
+    for (const line of head.slice(0, textEnd).split('\r\n')) {
+      const m = line.match(/^([a-z]+):\s?(.*)$/);
+      if (m) info.text[m[1]] = m[2];
+    }
+    info.textLength = 4 + textEnd + 2;
+  }
+
+  const dec = (i) => file[i] ^ 0x33;
+  const u32 = (i) => (dec(i) | dec(i + 1) << 8 | dec(i + 2) << 16 | dec(i + 3) << 24) >>> 0;
+  info.sp = u32(512);
+  info.reset = u32(516);
+  if ((info.sp & 0xfff00000) !== 0x20000000) errors.push(`Stack pointer ${hex32(info.sp)} is not in RAM: not a valid image.`);
+  if ((info.reset & 1) !== 1 || info.reset < 0x08006000 || info.reset >= 0x08080000) errors.push(`Reset address ${hex32(info.reset)} is not inside the app area (0x08006000…): not a valid image.`);
+
+  // the image carries its own "<15xx…name…>" reply string, and a "Vx.yy" + "yyyy-mm-dd-nnn" build tag
+  const imageText = [];
+  for (let i = 512; i < file.length; i++) imageText.push(String.fromCharCode(dec(i)));
+  const s = imageText.join('');
+  const nm = s.match(/<15[0-9A-F]{2}([A-Za-z0-9_.-]{3,40})>/);
+  info.embeddedName = nm ? nm[1] : null;
+  const ver = s.match(/V\d\.\d\d/);
+  const date = s.match(/20\d\d-\d\d-\d\d-\d{3}/);
+  info.build = [ver?.[0], date?.[0]].filter(Boolean).join(' ') || null;
+  if (!info.embeddedName) warnings.push('The image does not contain its own file name, so it can’t be matched to the box.');
+  return { ok: errors.length === 0, errors, warnings, info };
+}
+
+const hex32 = (n) => '0x' + (n >>> 0).toString(16).padStart(8, '0').toUpperCase();
+
 // ---------- effect catalogues ----------
 
 // "RGB" tab, gen >= 1 (names as in the official iOS app 2.6.6)

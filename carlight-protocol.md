@@ -138,3 +138,13 @@ Legacy (gen 0): `0800` single, `0802` breathe, `0803` gradient, `0806` strobe, `
 ## 7. Firmware update (OTA) – do NOT implement casually
 
 `<0DBB44>` → box replies `15xx<filename>` → app downloads hex from lmyiot.com → `<0E%06d(len)>` → box `<14>` → app sends **raw 200-byte binary chunks** (no framing/CRC), one per `<16>` ack. A bad image or interrupted transfer could brick the controller.
+
+Exact behaviour, confirmed by decompiling the vendor app (`FactoryActivity`, `WLSAPI`, `BLEService`) and the controller firmware:
+
+1. `<0DBB44>` → the box answers `<1501File122.bin>` in **plain ASCII** (not hex). `<1502>` means "update not supported".
+2. `POST {"fileName":"<name after 15xx>"}` to `https://api.lmyiot.com/server/server/downloadFile` (or the non-CN `http://fnjy.lmyiot.com/server/downloadFile`) → JSON `{"status":200,"result":"<hex>"}`. The **whole decoded file** is what gets sent: plain-text header + XOR body, unchanged. The server returns the current build for that name, not necessarily the one installed. It rejects browser (CORS) requests.
+3. `<0E%06d>` with the file length, e.g. `<0E231636>`. The app firmware stores the length + flag `0x55AA44BB` in its config page and resets into the bootloader. The JDY BLE module is a separate chip, so the connection survives. If the length equals the last update's, the box answers `<1502>` and stays in the app.
+4. Bootloader `<14>` → block 0. Each `<16>` → next block. Blocks are 200 bytes (last one shorter), **one GATT write without response each** (the vendor app requests MTU 255).
+5. No completion message. The vendor app closes its dialog 1 s after the last block. Our app waits 8 s, then polls `<0A01>` and checks the version reply.
+
+Our app implements this in Device → Firmware update (experimental). The file comes from a file picker (no network), it's checked (header, vector table at file offset 512, embedded name = the box's name, SHA-256 vs known vendor originals), and all other commands are locked out while it runs.
