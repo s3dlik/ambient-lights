@@ -1,0 +1,11 @@
+{
+  "name": "ambient-lights-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Independent Web Bluetooth controller for LOMO/lmyiot car ambient light boxes",
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "serve": "python -m http.server 8080"
+  }
+}
