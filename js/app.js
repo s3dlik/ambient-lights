@@ -6,7 +6,7 @@ import {
 import { Link, WebBluetoothTransport, DemoTransport, describeError } from './transport.js';
 import { OtaTransfer } from './ota-transfer.js';
 import { DiagnosticLog } from './diagnostics.js';
-import { DOOR_EFFECTS, DOOR_REASONS, DOOR_REFUSALS, isDoorFirmware, doorCommand, doorConfiguration, parseDoorReply } from './door-effects.js';
+import { DOOR_EFFECTS, DOOR_REASONS, DOOR_REFUSALS, isDoorFirmware, hasGoodbye, goodbyeCommand, doorCommand, doorConfiguration, parseDoorReply } from './door-effects.js';
 
 // ---------------------------------------------------------------------------
 // tiny DOM + state helpers
@@ -120,27 +120,29 @@ function send(payload, key) {
 // them every time it connects to a box running the door firmware.
 // ---------------------------------------------------------------------------
 
-const DOOR_DEFAULTS = { on: false, effect: 0, color: '#00ff80', brightness: 60, period: 15, mapping: DOOR_MAPPING, reverse: 0, enabled: 15 };
+const DOOR_DEFAULTS = { on: false, effect: 0, color: '#00ff80', brightness: 60, period: 15, mapping: DOOR_MAPPING, reverse: 0, enabled: 15, goodbye: false, goodbyeTime: 10 };
 const doorReady = () => state.connected && state.doorFx.verifiedConnection && isDoorFirmware(state.version.software) && !link.otaLock;
 function doorPrefs() {
   const prefs = { ...DOOR_DEFAULTS, ...state.doorFx.preferences };
-  try { doorConfiguration(prefs); return prefs; } catch { return { ...DOOR_DEFAULTS, on: prefs.on === true }; }
+  try { doorConfiguration(prefs); goodbyeCommand(true, prefs.goodbyeTime); return prefs; } catch { return { ...DOOR_DEFAULTS, on: prefs.on === true, goodbye: prefs.goodbye === true }; }
 }
 /** Send the saved door settings: the full configuration when on, Disable when off. */
 function sendDoorPrefs({ quiet = false } = {}) {
-  if (!doorReady()) { if (!quiet) toast('Needs the custom door firmware 261115-075'); return false; }
+  if (!doorReady()) { if (!quiet) toast('Needs the custom door firmware 261115-076'); return false; }
   const prefs = doorPrefs();
-  for (const command of prefs.on ? doorConfiguration(prefs) : [doorCommand(0)]) if (!send(command)) return false;
+  const commands = prefs.on ? doorConfiguration(prefs) : [doorCommand(0)];
+  if (hasGoodbye(state.version.software)) commands.push(goodbyeCommand(prefs.goodbye === true, prefs.goodbyeTime));
+  for (const command of commands) if (!send(command)) return false;
   return true;
 }
 let doorTimer = null;
 /** Save door settings on the phone; send them when the effect is on (or was just switched). */
 function setDoorPrefs(patch, { debounce = false } = {}) {
   const prefs = { ...doorPrefs(), ...patch };
-  doorConfiguration(prefs); // throws on invalid values
+  doorConfiguration(prefs); goodbyeCommand(true, prefs.goodbyeTime); // throw on invalid values
   store.set('doorEffects072', prefs);
   set({ doorFx: { ...state.doorFx, preferences: prefs } });
-  if (!prefs.on && !('on' in patch)) return;
+  if (!prefs.on && !prefs.goodbye && !('on' in patch) && !('goodbye' in patch)) return;
   clearTimeout(doorTimer);
   if (debounce) doorTimer = setTimeout(() => sendDoorPrefs(), 400);
   else sendDoorPrefs();
@@ -455,7 +457,7 @@ link.addEventListener('frame', (e) => {
     const verified = isDoorFirmware(f.software);
     set({ doorFx: { ...state.doorFx, verifiedConnection: verified } });
     // the box forgets door settings on every restart: re-send the saved ones
-    if (verified && doorPrefs().on) setTimeout(() => sendDoorPrefs({ quiet: true }), 500);
+    if (verified && (doorPrefs().on || doorPrefs().goodbye)) setTimeout(() => sendDoorPrefs({ quiet: true }), 500);
   }
   if (doorReply) {
     const replies = { ...state.doorFx.replies, [doorReply.kind]: doorReply.values };
@@ -952,13 +954,24 @@ function doorLightCard() {
     seg([[5, 'Fast'], [15, 'Normal'], [30, 'Slow']], () => doorPrefs().period, (period) => setDoorPrefs({ period })),
     slider('Brightness', 1, 10, () => Math.max(1, Math.round(doorPrefs().brightness / 10)), (x) => setDoorPrefs({ brightness: x * 10 }, { debounce: true })),
     h('p', { class: 'hint' }, 'Works while the ignition is on. Saved on this phone and sent again every time you connect. Which strip belongs to which door can be changed under Device › Custom door effects (advanced).'));
+  const goodbyeBody = h('div', {},
+    h('div', { class: 'toggle-line' },
+      h('div', {}, h('div', {}, 'Goodbye animation'), h('div', { class: 'hint', style: { margin: '2px 0 0' } }, 'When the ignition turns off: rear strips shrink toward the front, then the front strips toward the dash')),
+      seg([[true, 'ON'], [false, 'OFF']], () => doorPrefs().goodbye, (goodbye) => setDoorPrefs({ goodbye }))),
+    h('h3', {}, 'Goodbye speed'),
+    seg([[5, 'Fast'], [10, 'Normal'], [20, 'Slow']], () => doorPrefs().goodbyeTime, (goodbyeTime) => setDoorPrefs({ goodbyeTime })),
+    h('p', { class: 'hint' }, 'Only runs if the lights were on. Afterwards the strips stay dark until you open a door. If a strip shrinks toward the back, tick "reverse" for it under Device › Custom door effects (advanced).'));
+  const goodbyeMissing = h('p', { class: 'hint' }, 'Goodbye animation: needs firmware 261115-076.');
+  body.append(h('h3', {}, 'Goodbye'), goodbyeBody, goodbyeMissing);
   bind(() => {
     const prefs = doorPrefs();
     if (document.activeElement !== picker) picker.value = prefs.color;
     const supported = state.doorFx.verifiedConnection && isDoorFirmware(state.version.software);
     body.hidden = !supported;
+    goodbyeBody.hidden = !hasGoodbye(state.version.software);
+    goodbyeMissing.hidden = !goodbyeBody.hidden;
     const s = state.doorFx.replies.S;
-    status.textContent = !supported ? 'Needs the custom door firmware 261115-075 (Device › Firmware update).'
+    status.textContent = !supported ? 'Needs the custom door firmware 261115-076 (Device › Firmware update).'
       : !prefs.on ? 'Off: doors show the normal warning.'
         : !s ? 'On: settings sent.'
           : s[4] === 1 ? 'On: a door effect is showing now.'
@@ -1204,7 +1217,7 @@ function buildDoorEffects() {
   });
   const actions = [];
   const sendDoor = payload => {
-    if (!state.doorFx.verifiedConnection || !isDoorFirmware(state.version.software)) { toast('This control requires a fresh 261115-072, -074 or -075 firmware reply'); return false; }
+    if (!state.doorFx.verifiedConnection || !isDoorFirmware(state.version.software)) { toast('This control requires a fresh 261115-072, -074, -075 or -076 firmware reply'); return false; }
     return send(payload);
   };
   const button = (label, fn, primary = false) => {
@@ -1217,7 +1230,7 @@ function buildDoorEffects() {
         enabled: enables.reduce((n, c, i) => n | (c.checked ? 1 << i : 0), 0) };
       const commands = doorConfiguration(config);
       for (const command of commands) if (!sendDoor(command)) return;
-      const saved = { ...config, on: true };
+      const saved = { ...doorPrefs(), ...config, on: true };
       store.set('doorEffects072', saved); set({ doorFx: { ...state.doorFx, preferences: saved } });
       toast('Settings queued. Read controller status to confirm.');
     } catch (e) { toast(e.message); }
@@ -1233,7 +1246,7 @@ function buildDoorEffects() {
     const supported = state.doorFx.verifiedConnection && isDoorFirmware(state.version.software);
     actions.forEach(b => { b.disabled = !supported || !state.connected || link.otaLock; });
     const s = state.doorFx.replies.S, x = state.doorFx.replies.X;
-    status.textContent = !supported ? 'Requires the custom 261115-072, -074 or -075 firmware. These controls do not operate on 071 or vendor firmware.'
+    status.textContent = !supported ? 'Requires the custom 261115-072, -074, -075 or -076 firmware. These controls do not operate on 071 or vendor firmware.'
       : s ? `Last read: ${s[0] ? 'Enabled' : 'Disabled'} · ignition value ${s[1]} · door bits ${s[2].toString(16).toUpperCase()} · active channels ${s[3].toString(16).toUpperCase()} · ${DOOR_REASONS[s[4]] || 'Unknown state'}`
         : 'Read status to check the controller. Settings are disabled after a controller restart until you apply them again.';
     if (supported && x) status.textContent += ` · Last refusal: ${DOOR_REFUSALS[x[0]] || `code ${x[0]}`}`;

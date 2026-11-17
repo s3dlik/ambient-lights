@@ -1,7 +1,15 @@
 // Protocol for the opt-in File122 072 firmware. No writes occur in this module.
-/** Custom firmware versions that implement this door-effects protocol (072 compact, 074/075 stream mode). */
-export const DOOR_FIRMWARE = ['261115-072', '261115-074', '261115-075'];
+/** Custom firmware versions that implement this door-effects protocol (072 compact, 074-076 stream mode). */
+export const DOOR_FIRMWARE = ['261115-072', '261115-074', '261115-075', '261115-076'];
 export const isDoorFirmware = software => DOOR_FIRMWARE.includes(software);
+/** Versions with the ignition-off goodbye (op 5). */
+export const GOODBYE_FIRMWARE = ['261115-076'];
+export const hasGoodbye = software => GOODBYE_FIRMWARE.includes(software);
+/** op 5: goodbye on/off and time per stage (rear strips, then front) in 100 ms steps. */
+export function goodbyeCommand(on, time) {
+  if (!Number.isInteger(time) || time < 3 || time > 50) throw new Error('Invalid goodbye time');
+  return doorCommand(5, [on ? 1 : 0, time]);
+}
 export const DOOR_EFFECTS = ['Solid', 'Blink', 'Pulse', 'Repeating wipe', 'Comet'];
 const byte = (n, max = 255) => {
   if (!Number.isInteger(n) || n < 0 || n > max) throw new Error('Door-effect value out of range');
