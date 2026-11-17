@@ -193,7 +193,8 @@ test('unavailable or corrupt browser storage does not break live diagnostics', (
   assert.equal(corrupt.entries.length, 0);
 });
 
-test('232704 bytes transfer through the actual Link as 1164 blocks in 20-byte pieces', { timeout: 10000 }, async () => {
+// Windows can round each zero-delay queue timer to ~16ms across 1,000+ blocks.
+test('232704 bytes transfer through the actual Link as 1164 blocks in 20-byte pieces', { timeout: 60000 }, async () => {
   const file = Uint8Array.from({ length: 232704 }, (_, i) => i % 251);
   const received = [];
   let byteCount = 0, largestPiece = 0, transfer;
@@ -215,7 +216,7 @@ test('232704 bytes transfer through the actual Link as 1164 blocks in 20-byte pi
   transfer.cancel(); await link.disconnect();
 });
 
-test('disconnect beyond block 1000 preserves the exact attempted block and accepted partial bytes', { timeout: 10000 }, async () => {
+test('disconnect beyond block 1000 preserves the exact attempted block and accepted partial bytes', { timeout: 60000 }, async () => {
   const file = new Uint8Array(232704);
   let byteCount = 0, transfer;
   const link = connectedLink(async piece => {

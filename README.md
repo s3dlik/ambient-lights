@@ -68,6 +68,12 @@ Reading them is safe. To change anything, tick **Allow changes**; each write the
 
 Deliberately **not** included: key learning, light-parameter import, customer-code import and "original car lights" flashing. The raw console blocks those commands and the firmware-update opcodes (`0D`/`0E`).
 
+## Custom door colors and effects (072)
+
+The local app adds **Device → Custom door colors and effects (072)**: an RGB picker, solid/blink/pulse/repeating wipe/comet, brightness, cycle, channel mapping/direction, timed previews, Disable and runtime status. These controls require a fresh `261115-072` reply on the current connection and are locked during OTA. Preferences stay on the phone; controller settings are held in RAM and start disabled after a restart. Apply explicitly to enable them again.
+
+The new File122 `072` firmware is an opt-in hardware-test build following the successful `071` manual RGB test. It uses native door signals to select custom strip packets, pauses for native welcome/A/C activity, and sends a flat native-color hand-back on close/Disable. Receiver priority outside native welcome, physical mapping and exact restoration of dynamic effects still need car testing. `072` has **not** been flashed; the latest confirmed installed build is `071`. It does not add a leaving animation. The local private guide and binary are under `firmware/test-builds/File122-door-effects-072/`; vendor firmware remains excluded from Git. The guide includes commands usable through the existing app's console before publishing the new panel.
+
 ## Firmware update (experimental)
 
 Device → **Firmware update** uses the same procedure as the vendor app (see `carlight-protocol.md` §7).
@@ -80,17 +86,18 @@ The updater defaults to 20-byte pieces. It records the selected file's full SHA-
 - File122.bin (V6.30, 2026-11-15) installed successfully from an Android 7.1.2 phone (Chrome 112), with **Block writes = 20-byte pieces**.
 - The bootloader accepts the blocks split into small packets.
 - The update **reset the light settings**, which had to be set up again. Back up first.
-- A subsequent marker-only custom File122 update also succeeded: a fresh Bluetooth reply confirmed **`261115-007` → `261115-070`**. The user reported no breakage. This verifies that specific same-size, checksum-preserving modification. On 2026-11-17, a larger `071` attempt disconnected before visible completion; reinstalling `070` succeeded with a fresh version reply and normal operation reported. This demonstrates recovery from that interruption, while complete `071` acceptance, rejected-image recovery and rollback from a running `071` remain untested.
+- A subsequent marker-only custom File122 update also succeeded: a fresh Bluetooth reply confirmed **`261115-007` → `261115-070`**. The user reported no breakage. This verifies that specific same-size, checksum-preserving modification. On 2026-11-17, a larger `071` attempt disconnected before visible completion; reinstalling `070` succeeded with a fresh version reply and normal operation reported. This demonstrates recovery from that interruption; rejected-image recovery and rollback from a running `071` remain untested.
+- A later complete upload of the **232,704-byte executable `071` image succeeded**, with a full matching file hash and fresh **`261115-071`** reply. The added Status/Start/Stop commands responded, and the user reports cyan/orange door strips while the dashboard appeared to retain purple. The entire upload was reported to occur with the vehicle off; the timestamped log spans about 10 min 3 s from start to fresh version, using 20-byte pieces and writes without response. This establishes that specific custom executable image and manual RGB experiment. Automatic individual-door effects and a leaving animation are not implemented by `071`.
 - On older Android phones, start with 20-byte pieces. On iPhone, the vendor says "change your phone".
 
 The vendor's bootloader could not be inspected, so it still carries some risk:
-- Use only the vendor file for your box's exact name. Device → Firmware file name shows the name; the file has to be downloaded on a computer and copied to the phone.
+- Use the vendor file for your box's exact name, or the explicitly prepared custom test build for that same controller. Device → Firmware file name shows the name; copy the selected file to the phone.
 - Car parked, controller power maintained throughout the update, phone charged, page kept in the foreground. Ignition on is a precaution against power loss, not a protocol requirement: the user completed the `070` recovery with ignition off. Whether the controller stays powered depends on its installation and sleep behavior; switching on the radio alone does not establish this. iOS pauses background pages, which would stall the transfer.
 - If it's interrupted, follow the vendor's recovery procedure: switch the car off, cut the control box's main power for about a minute (its power connector or fuse), reconnect, and tap "Retry from the start". The vendor's answer was "Update", meaning the box stays in update mode until a complete update has been installed. The app first asks for the file name. If there's no answer, it sends the update request directly and starts again from block 1.
 
 ## Not yet verified on the real box
 
-The protocol comes from decompiled code and has only been tested against the built-in simulator. Check these on the first run:
+Many individual controls still rely on decompiled code and simulator checks. Check these on the first run:
 - Whether the box sends a fresh status after each command (the app doesn't rely on it).
 - Night-level vs sound-source: the vendor app reads the same status byte for both.
 - Whether Effect toggle (`29xx`) is reported back 0- or 1-based.

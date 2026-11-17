@@ -6,6 +6,7 @@ import {
 import { Link, WebBluetoothTransport, DemoTransport, describeError } from './transport.js';
 import { OtaTransfer } from './ota-transfer.js';
 import { DiagnosticLog } from './diagnostics.js';
+import { DOOR_EFFECTS, DOOR_REASONS, doorCommand, doorConfiguration, parseDoorReply } from './door-effects.js';
 
 // ---------------------------------------------------------------------------
 // tiny DOM + state helpers
@@ -59,6 +60,7 @@ const state = {
   // device
   version: {}, statusSeen: false,
   fwName: { status: 'idle', name: null, raw: null, at: null }, // idle | waiting | done | timeout | unsupported
+  doorFx: { replies: {}, preferences: store.get('doorEffects072', { effect: 0, color: '#00ff80', brightness: 60, period: 15, mapping: [0, 2, 3, 1], reverse: 0, enabled: 15 }) },
   // firmware update. phase: idle | loaded | asking | entering | sending | verifying | done | failed | stalled
   ota: { phase: 'idle', fileName: '', file: null, check: null, sha: '', known: null, block: 0, total: 0, message: '', pieceMode: '20', oldSoftware: '', progress: {} },
   factory: { active: false, edit: false, dial: null, draftDial: null, lamps: null, draftLamps: null, result: null },
@@ -383,6 +385,9 @@ link.addEventListener('tx', (e) => {
 link.addEventListener('error', (e) => { addLog('err', e.detail.message); toast(e.detail.message); });
 link.addEventListener('frame', (e) => {
   const f = parseFrame(e.detail.payload);
+  const doorReply = parseDoorReply(e.detail.payload);
+  if (f.type === 'version') set({ doorFx: { ...state.doorFx, verifiedConnection: f.software === '261115-072' } });
+  if (doorReply) set({ doorFx: { ...state.doorFx, replies: { ...state.doorFx.replies, [doorReply.kind]: doorReply.values } } });
   // during a firmware update log only every 50th <16>, so the start of the log (the interesting part) survives
   const quietAck = f.type === 'otaNext' && state.ota.phase === 'sending' && (state.ota.block + 1) % 50 !== 0;
   if (!quietAck) addLog('rx', `<${e.detail.payload}>`, f.type);
@@ -390,10 +395,12 @@ link.addEventListener('frame', (e) => {
 });
 link.addEventListener('state', (e) => {
   if (e.detail.connected) {
+    state.doorFx = { ...state.doorFx, verifiedConnection: false, replies: {} };
     set({ connected: true, connecting: false });
     setTimeout(() => send(Cmd.hello()), 1000); // vendor app waits 1 s, then asks for state
   } else {
     const wasFactory = state.factory.active;
+    state.doorFx = { ...state.doorFx, verifiedConnection: false, replies: {} };
     set({ connected: false, connecting: false, factory: { ...state.factory, active: false } });
     if (wasFactory) toast('Disconnected (installer mode ended)');
   }
@@ -1069,6 +1076,68 @@ function buildLab() {
 // ---------------------------------------------------------------------------
 
 let logPre, logCard, otaCard, offlineTools, deviceTools;
+
+function buildDoorEffects() {
+  const defaults = { effect: 0, color: '#00ff80', brightness: 60, period: 15, mapping: [0, 2, 3, 1], reverse: 0, enabled: 15 };
+  let prefs = { ...defaults, ...state.doorFx.preferences };
+  try { doorConfiguration(prefs); } catch { prefs = defaults; }
+  const color = h('input', { type: 'color', class: 'input', value: prefs.color, 'aria-label': 'Door warning color' });
+  const effect = h('select', { class: 'input' }, ...DOOR_EFFECTS.map((label, i) => h('option', { value: String(i) }, label)));
+  effect.value = String(prefs.effect);
+  const brightness = h('input', { type: 'number', min: '0', max: '100', step: '1', class: 'input', value: String(prefs.brightness) });
+  const period = h('select', { class: 'input' }, ...[5, 10, 15, 20, 30, 50, 100].map(n => h('option', { value: String(n) }, `${n / 10} seconds per cycle`)));
+  period.value = String(prefs.period);
+  const maps = [], reverses = [], enables = [];
+  const mappingRows = Array.from({ length: 4 }, (_, slot) => {
+    const map = h('select', { class: 'input', 'aria-label': `C${slot} door signal` }, ...[0, 1, 2, 3].map(n => h('option', { value: String(n) }, `Door signal ${n + 1}`)));
+    map.value = String(prefs.mapping[slot]); maps.push(map);
+    const reverse = h('input', { type: 'checkbox', checked: !!(prefs.reverse & (1 << slot)) }); reverses.push(reverse);
+    const enable = h('input', { type: 'checkbox', checked: !!(prefs.enabled & (1 << slot)) }); enables.push(enable);
+    return h('div', { class: 'field' }, h('label', {}, `Strip channel C${slot}`), map,
+      h('label', { class: 'check' }, enable, 'Use custom effect on this channel'), h('label', { class: 'check' }, reverse, 'Reverse animation direction'));
+  });
+  const actions = [];
+  const sendDoor = payload => {
+    if (!state.doorFx.verifiedConnection || state.version.software !== '261115-072') { toast('This control requires a fresh firmware 261115-072 reply'); return false; }
+    return send(payload);
+  };
+  const button = (label, fn, primary = false) => {
+    const b = h('button', { class: `btn ${primary ? 'primary ' : ''}block`, type: 'button', onclick: fn }, label); actions.push(b); return b;
+  };
+  const apply = button('Apply and enable door effects', () => {
+    try {
+      const config = { effect: Number(effect.value), color: color.value, brightness: Number(brightness.value), period: Number(period.value),
+        mapping: maps.map(m => Number(m.value)), reverse: reverses.reduce((n, c, i) => n | (c.checked ? 1 << i : 0), 0),
+        enabled: enables.reduce((n, c, i) => n | (c.checked ? 1 << i : 0), 0) };
+      const commands = doorConfiguration(config);
+      for (const command of commands) if (!sendDoor(command)) return;
+      state.doorFx.preferences = config; store.set('doorEffects072', config);
+      toast('Settings queued. Read controller status to confirm.');
+    } catch (e) { toast(e.message); }
+  }, true);
+  const read = button('Read door effect status', () => sendDoor(doorCommand(2)));
+  const stop = button('Disable custom door effects', () => sendDoor(doorCommand(0)));
+  const preview = h('div', { class: 'row' }, ...[0, 1, 2, 3].map(i => button(`Preview C${i}`, () => sendDoor(doorCommand(5, [1 << i, 10])))));
+  const status = h('p', { class: 'hint' });
+  bind(() => {
+    const supported = state.doorFx.verifiedConnection && state.version.software === '261115-072';
+    actions.forEach(b => { b.disabled = !supported || !state.connected || link.otaLock; });
+    const s = state.doorFx.replies.S;
+    status.textContent = !supported ? 'Requires the experimental 261115-072 firmware. These controls do not operate on 071 or vendor firmware.'
+      : s ? `Last read: ${s[0] ? 'Enabled' : 'Disabled'} · ignition value ${s[1]} · door bits ${s[2].toString(16).toUpperCase()} · active channels ${s[3].toString(16).toUpperCase()} · ${DOOR_REASONS[s[4]] || 'Unknown state'}`
+        : 'Read status to check the controller. Settings are disabled after a controller restart until you apply them again.';
+  });
+  return detailsCard('Custom door colors and effects (072)', status,
+    h('p', { class: 'hint' }, 'Experimental: configure while parked. Native welcome and A/C overlays have priority. The provisional door mapping and receiver priority still need checking on the car. Settings stay in controller RAM until its next restart; preferences are saved on this phone. This version does not add a leaving animation.'),
+    h('div', { class: 'field' }, h('label', {}, 'Door warning color'), color),
+    h('div', { class: 'field' }, h('label', {}, 'Effect'), effect),
+    h('div', { class: 'field' }, h('label', {}, 'Brightness limit (%) — also follows native dimming'), brightness),
+    h('div', { class: 'field' }, h('label', {}, 'Effect cycle'), period),
+    h('details', {}, h('summary', {}, 'Map doors and animation direction'),
+      h('p', { class: 'hint' }, 'Preview one channel at a time to identify its physical door. Open one door and read status to identify its signal bit (1, 2, 4, or 8). Assign each of the four signals once; the default mapping is provisional.'), ...mappingRows),
+    apply, read, preview, stop,
+    h('p', { class: 'hint' }, 'Preview uses the last settings applied to the controller and lasts 10 seconds. Disable ends automatic effects and previews. After closing a door, the controller sends a flat native-color hand-back while normal animation packets continue; exact receiver restoration still needs verification.'));
+}
 function renderLog() {
   if (!logPre || logPre.closest('details')?.open === false) return;
   const fmt = (d) => d.toTimeString().slice(0, 8);
@@ -1394,7 +1463,7 @@ function buildDevice() {
       h('div', { class: 'row', style: { 'margin-top': '12px' } },
         h('button', { class: 'btn', type: 'button', onclick: () => send(Cmd.hello()) }, 'Refresh state'),
         h('button', { class: 'btn danger', type: 'button', onclick: async () => { factoryExit(); await new Promise((r) => setTimeout(r, 150)); link.disconnect(); } }, 'Disconnect'))),
-    installer, fwCard, deviceTools, consoleCard,
+    installer, fwCard, buildDoorEffects(), deviceTools, consoleCard,
     card('About', null, h('p', { class: 'hint', style: { margin: 0 } },
       'Independent controller built from a protocol analysis of the vendor app. It makes no network requests and saves scenes, connection preferences and recent Bluetooth diagnostics on this phone. Not affiliated with the hardware vendor.')),
   );
@@ -1407,7 +1476,7 @@ async function copyText(text) {
 function saveDiagnosticReport() {
   const report = diagnostics.report({ app: 'ambient-lights-uploader-2', userAgent: navigator.userAgent,
     visibility: document.visibilityState, connected: link.connected, device: link.name,
-    version: state.version, writeMode: lastTransport?.writeMode || 'unknown', storageAvailable: !!diagnostics.persistent });
+    version: state.version, doorEffects: state.doorFx.replies, writeMode: lastTransport?.writeMode || 'unknown', storageAvailable: !!diagnostics.persistent });
   const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' }));
   const anchor = h('a', { href: url, download: `ambient-lights-report-${new Date().toISOString().replace(/[:.]/g, '-')}.json` });
   document.body.append(anchor); anchor.click(); anchor.remove();

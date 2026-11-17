@@ -7,6 +7,7 @@ import * as protocol from '../js/protocol.js';
 import * as transport from '../js/transport.js';
 import { OtaTransfer } from '../js/ota-transfer.js';
 import { DiagnosticLog } from '../js/diagnostics.js';
+import * as doorEffects from '../js/door-effects.js';
 
 // Small DOM fixture for exercising the actual app event handlers and card placement.
 // This verifies behavior, not browser layout or CSS.
@@ -42,7 +43,7 @@ function appHarness(storage = new Map()) {
     querySelectorAll: selector => selector === '#tabbar button' ? tabs.children : [],
   });
   const timers = new Map(); let nextTimer = 0;
-  const context = vm.createContext({ ...protocol, ...transport, OtaTransfer, DiagnosticLog,
+  const context = vm.createContext({ ...protocol, ...transport, ...doorEffects, OtaTransfer, DiagnosticLog,
     document, window: Object.assign(new EventTarget(), { scrollTo() {} }),
     navigator: { userAgent: 'test browser', platform: 'test', clipboard: { writeText: async () => {} } },
     localStorage: { getItem: k => storage.get(k), setItem: (k, v) => storage.set(k, v) },
@@ -182,4 +183,51 @@ test('the actual app runs filename, length, block transfer and a matching post-t
   assert.deepEqual(sent, ['<0DBB44>', '<0E000436>', '<0A01>']);
   assert.equal(app.diagnostics.lastUpdate.phase, 'done');
   app.otaTransfer.cancel();
+});
+
+test('door effects require a fresh 072 version on this connection, and disconnect invalidates it', () => {
+  const app=appHarness(); app.buildConnect(); app.buildDevice();
+  const apply=app.body.all().find(e=>e.tag==='button' && e.textContent==='Apply and enable door effects');
+  const writes=[];
+  app.link.transport={connected:true,write:async bytes=>writes.push(bytes),disconnect:async()=>{}};
+  app.state.connected=true; app.state.version.software='261115-072';
+  app.otaSet({phase:'idle'}); // refresh all actual bindings
+  assert.equal(apply.disabled,true); // cached version is insufficient
+  apply.dispatchEvent(new Event('click'));
+  assert.equal(writes.length,0);
+  const version='13'+Buffer.from('V6.303229-B60261115-072').toString('hex').toUpperCase();
+  app.link.emit('frame',{payload:version});
+  assert.equal(apply.disabled,false);
+  app.link.emit('state',{connected:false});
+  assert.equal(apply.disabled,true);
+  assert.equal(app.state.doorFx.verifiedConnection,false);
+});
+
+test('door panel applies settings in order, retains runtime status, and blocks actions under OTA', {timeout:2000}, async t => {
+  const app=appHarness(); app.buildConnect(); app.buildDevice();
+  const writes=[]; let finish;
+  const complete=new Promise(resolve=>{finish=resolve;});
+  app.link.gapMs=0;
+  app.link.transport={connected:true,write:async bytes=>{
+    writes.push(String.fromCharCode(...bytes)); if(writes.length===3) finish();
+  },disconnect:async()=>{}};
+  t.after(()=>app.link.disconnect());
+  app.state.connected=true;
+  app.link.emit('frame',{payload:'13'+Buffer.from('V6.303229-B60261115-072').toString('hex').toUpperCase()});
+  const button=label=>app.body.all().find(e=>e.tag==='button' && e.textContent===label);
+  button('Apply and enable door effects').dispatchEvent(new Event('click'));
+  await complete;
+  const expected=doorEffects.doorConfiguration({effect:0,color:'#00ff80',brightness:60,period:15,mapping:[0,2,3,1],reverse:0,enabled:15});
+  assert.deepEqual(writes,expected.map(payload=>`<${payload}>`));
+  assert.equal(JSON.parse(app.storage.get('al.doorEffects072')).color,'#00ff80');
+  app.link.emit('frame',{payload:'072 S 0103010101'});
+  assert.deepEqual(Array.from(app.state.doorFx.replies.S),[1,3,1,1,1]);
+  assert.match(app.body.querySelector('#view-device').textContent,/Door effect active/);
+  app.link.otaLock=true; app.otaSet({phase:'sending'});
+  for(const label of ['Read door effect status','Preview C0','Disable custom door effects']) {
+    assert.equal(button(label).disabled,true);
+    button(label).dispatchEvent(new Event('click'));
+  }
+  assert.equal(writes.length,3);
+  assert.equal(app.link.queue.length,0);
 });
