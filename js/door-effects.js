@@ -1,4 +1,7 @@
 // Protocol for the opt-in File122 072 firmware. No writes occur in this module.
+/** Custom firmware versions that implement this door-effects protocol (072 compact, 074 stream mode). */
+export const DOOR_FIRMWARE = ['261115-072', '261115-074'];
+export const isDoorFirmware = software => DOOR_FIRMWARE.includes(software);
 export const DOOR_EFFECTS = ['Solid', 'Blink', 'Pulse', 'Repeating wipe', 'Comet'];
 const byte = (n, max = 255) => {
   if (!Number.isInteger(n) || n < 0 || n > max) throw new Error('Door-effect value out of range');

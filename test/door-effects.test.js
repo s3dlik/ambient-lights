@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { doorCommand, doorConfiguration, parseDoorReply } from '../js/door-effects.js';
+import { doorCommand, doorConfiguration, parseDoorReply, isDoorFirmware } from '../js/door-effects.js';
 import { BLOCKED_PREFIXES } from '../js/protocol.js';
 
 test('072 commands are exact ten-byte frames with XOR checksum and stay outside OTA opcodes', () => {
@@ -30,4 +30,9 @@ test('runtime replies decode only the exact 072 diagnostic formats', () => {
   assert.deepEqual(parseDoorReply('072 N 00000100'),{kind:'N',values:[0,0,1,0]});
   assert.deepEqual(parseDoorReply('<072 X 03>'),{kind:'X',values:[3]});
   for (const text of ['071 IDLE','072 S 00','072 Q 0000','072 S ZZZZZZZZZZ','072 ARMED','072 X 0303']) assert.equal(parseDoorReply(text),null);
+});
+
+test('door panel firmware gate accepts only 072 and 074', () => {
+  for (const v of ['261115-072','261115-074']) assert.equal(isDoorFirmware(v),true);
+  for (const v of ['261115-071','261115-073','261115-007','']) assert.equal(isDoorFirmware(v),false);
 });

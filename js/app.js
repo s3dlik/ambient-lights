@@ -6,7 +6,7 @@ import {
 import { Link, WebBluetoothTransport, DemoTransport, describeError } from './transport.js';
 import { OtaTransfer } from './ota-transfer.js';
 import { DiagnosticLog } from './diagnostics.js';
-import { DOOR_EFFECTS, DOOR_REASONS, DOOR_REFUSALS, doorCommand, doorConfiguration, parseDoorReply } from './door-effects.js';
+import { DOOR_EFFECTS, DOOR_REASONS, DOOR_REFUSALS, isDoorFirmware, doorCommand, doorConfiguration, parseDoorReply } from './door-effects.js';
 
 // ---------------------------------------------------------------------------
 // tiny DOM + state helpers
@@ -405,7 +405,7 @@ link.addEventListener('error', (e) => { addLog('err', e.detail.message); toast(e
 link.addEventListener('frame', (e) => {
   const f = parseFrame(e.detail.payload);
   const doorReply = parseDoorReply(e.detail.payload);
-  if (f.type === 'version') set({ doorFx: { ...state.doorFx, verifiedConnection: f.software === '261115-072' } });
+  if (f.type === 'version') set({ doorFx: { ...state.doorFx, verifiedConnection: isDoorFirmware(f.software) } });
   if (doorReply) {
     const replies = { ...state.doorFx.replies, [doorReply.kind]: doorReply.values };
     if (doorReply.kind === 'S') delete replies.X; // an accepted command supersedes an earlier refusal
@@ -1121,7 +1121,7 @@ function buildDoorEffects() {
   });
   const actions = [];
   const sendDoor = payload => {
-    if (!state.doorFx.verifiedConnection || state.version.software !== '261115-072') { toast('This control requires a fresh firmware 261115-072 reply'); return false; }
+    if (!state.doorFx.verifiedConnection || !isDoorFirmware(state.version.software)) { toast('This control requires a fresh 261115-072 or -074 firmware reply'); return false; }
     return send(payload);
   };
   const button = (label, fn, primary = false) => {
@@ -1142,15 +1142,15 @@ function buildDoorEffects() {
   const stop = button('Disable custom door effects', () => sendDoor(doorCommand(0)));
   const status = h('p', { class: 'hint' });
   bind(() => {
-    const supported = state.doorFx.verifiedConnection && state.version.software === '261115-072';
+    const supported = state.doorFx.verifiedConnection && isDoorFirmware(state.version.software);
     actions.forEach(b => { b.disabled = !supported || !state.connected || link.otaLock; });
     const s = state.doorFx.replies.S, x = state.doorFx.replies.X;
-    status.textContent = !supported ? 'Requires the experimental 261115-072 firmware. These controls do not operate on 071 or vendor firmware.'
+    status.textContent = !supported ? 'Requires the experimental 261115-072 or 261115-074 firmware. These controls do not operate on 071 or vendor firmware.'
       : s ? `Last read: ${s[0] ? 'Enabled' : 'Disabled'} · ignition value ${s[1]} · door bits ${s[2].toString(16).toUpperCase()} · active channels ${s[3].toString(16).toUpperCase()} · ${DOOR_REASONS[s[4]] || 'Unknown state'}`
         : 'Read status to check the controller. Settings are disabled after a controller restart until you apply them again.';
     if (supported && x) status.textContent += ` · Last refusal: ${DOOR_REFUSALS[x[0]] || `code ${x[0]}`}`;
   });
-  return detailsCard('Custom door colors and effects (072)', status,
+  return detailsCard('Custom door colors and effects (072/074)', status,
     h('p', { class: 'hint' }, 'Experimental: configure while parked. Native welcome and A/C overlays have priority. The provisional door mapping and receiver priority still need checking on the car. Settings stay in controller RAM until its next restart; preferences are saved on this phone. This version does not add a leaving animation.'),
     h('div', { class: 'field' }, h('label', {}, 'Door warning color'), color),
     h('div', { class: 'field' }, h('label', {}, 'Effect'), effect),
