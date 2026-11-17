@@ -267,7 +267,7 @@ test('door panel applies settings in order, retains runtime status, and blocks a
   const button=label=>app.body.all().find(e=>e.tag==='button' && e.textContent===label);
   button('Apply and enable door effects').dispatchEvent(new Event('click'));
   await complete;
-  const expected=doorEffects.doorConfiguration({effect:0,color:'#00ff80',brightness:60,period:15,mapping:[0,2,3,1],reverse:0,enabled:15});
+  const expected=doorEffects.doorConfiguration({effect:0,color:'#00ff80',brightness:60,period:15,mapping:[2,0,1,3],reverse:0,enabled:15});
   assert.deepEqual(writes,expected.map(payload=>`<${payload}>`));
   assert.equal(JSON.parse(app.storage.get('al.doorEffects072')).color,'#00ff80');
   app.link.emit('frame',{payload:'072 S 0103010101'});
@@ -290,6 +290,10 @@ test('door panel applies settings in order, retains runtime status, and blocks a
 test('Car page door card re-sends saved settings on connect and switches off with Disable', {timeout:2000}, async t => {
   const saved={on:true,effect:2,color:'#ff0000',brightness:80,period:15,mapping:[0,2,3,1],reverse:0,enabled:15};
   const app=appHarness(new Map([['al.doorEffects072',JSON.stringify(saved)]])); app.buildConnect(); app.buildCar();
+  // the old provisional mapping saved on the phone is replaced once by the order measured on the car
+  const fixed={...saved,mapping:[2,0,1,3]};
+  assert.deepEqual(JSON.parse(app.storage.get('al.doorEffects072')).mapping,[2,0,1,3]);
+  assert.equal(app.storage.get('al.doorMappingFixed'),'true');
   const light=app.body.querySelector('#view-car').all().find(e=>e.tag==='div' && e.children[0]?.tag==='h2' && e.children[0].textContent.startsWith('Doors'));
   assert.ok(light,'Doors card is on the Car page');
   assert.match(light.textContent,/Needs the custom door firmware 261115-075/);
@@ -307,12 +311,12 @@ test('Car page door card re-sends saved settings on connect and switches off wit
   assert.ok(resend,'saved door settings are scheduled for re-sending');
   resend.fn();
   await until(3);
-  assert.deepEqual(writes,doorEffects.doorConfiguration(saved).map(p=>`<${p}>`));
+  assert.deepEqual(writes,doorEffects.doorConfiguration(fixed).map(p=>`<${p}>`));
   // Picking a colour while ON sends the new configuration straight away.
   const swatch=light.all().find(e=>e.tag==='button' && e['aria-label']==='Colour 4');
   swatch.dispatchEvent(new Event('click'));
   await until(6);
-  assert.deepEqual(writes.slice(3),doorEffects.doorConfiguration({...saved,color:'#00ff00'}).map(p=>`<${p}>`));
+  assert.deepEqual(writes.slice(3),doorEffects.doorConfiguration({...fixed,color:'#00ff00'}).map(p=>`<${p}>`));
   // OFF sends Disable once and remembers it; colour changes while OFF are only saved.
   const off=light.all().filter(e=>e.tag==='button' && e.textContent==='OFF').at(-1);
   off.dispatchEvent(new Event('click'));

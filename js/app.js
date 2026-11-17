@@ -36,6 +36,20 @@ const store = {
   set(k, v) { try { localStorage.setItem('al.' + k, JSON.stringify(v)); } catch { /* private mode etc. */ } },
 };
 
+// Door strip order measured on the car (2026-11-17). Channel Cn lights for door signal DOOR_MAPPING[n]:
+// C0 rear-left strip <- rear-left door, C1 front-left <- driver, C2 front-right <- front-right, C3 rear-right <- rear-right.
+// The first guess [0, 2, 3, 1] swapped front and rear on both sides.
+const DOOR_MAPPING = [2, 0, 1, 3];
+function loadDoorPrefs() {
+  const prefs = store.get('doorEffects072', { effect: 0, color: '#00ff80', brightness: 60, period: 15, mapping: [...DOOR_MAPPING], reverse: 0, enabled: 15 });
+  // one-time fix for phones that saved the old guess; a later manual choice is kept
+  if (!store.get('doorMappingFixed', false)) {
+    if (String(prefs.mapping) === '0,2,3,1') { prefs.mapping = [...DOOR_MAPPING]; store.set('doorEffects072', prefs); }
+    store.set('doorMappingFixed', true);
+  }
+  return prefs;
+}
+
 const emptySlots = () => Array(8).fill(PALETTE_EMPTY);
 const diagnostics = new DiagnosticLog({
   getItem: key => localStorage.getItem(key),
@@ -60,7 +74,7 @@ const state = {
   // device
   version: {}, statusSeen: false,
   fwName: { status: 'idle', name: null, raw: null, at: null }, // idle | waiting | done | timeout | unsupported
-  doorFx: { replies: {}, preferences: store.get('doorEffects072', { effect: 0, color: '#00ff80', brightness: 60, period: 15, mapping: [0, 2, 3, 1], reverse: 0, enabled: 15 }) },
+  doorFx: { replies: {}, preferences: loadDoorPrefs() },
   // firmware update. phase: idle | loaded | asking | entering | sending | verifying | done | failed | stalled
   ota: { phase: 'idle', fileName: '', file: null, check: null, sha: '', known: null, block: 0, total: 0, message: '', pieceMode: '20', oldSoftware: '', progress: {} },
   factory: { active: false, edit: false, dial: null, draftDial: null, lamps: null, draftLamps: null, result: null },
@@ -106,7 +120,7 @@ function send(payload, key) {
 // them every time it connects to a box running the door firmware.
 // ---------------------------------------------------------------------------
 
-const DOOR_DEFAULTS = { on: false, effect: 0, color: '#00ff80', brightness: 60, period: 15, mapping: [0, 2, 3, 1], reverse: 0, enabled: 15 };
+const DOOR_DEFAULTS = { on: false, effect: 0, color: '#00ff80', brightness: 60, period: 15, mapping: DOOR_MAPPING, reverse: 0, enabled: 15 };
 const doorReady = () => state.connected && state.doorFx.verifiedConnection && isDoorFirmware(state.version.software) && !link.otaLock;
 function doorPrefs() {
   const prefs = { ...DOOR_DEFAULTS, ...state.doorFx.preferences };
@@ -1225,13 +1239,13 @@ function buildDoorEffects() {
     if (supported && x) status.textContent += ` · Last refusal: ${DOOR_REFUSALS[x[0]] || `code ${x[0]}`}`;
   });
   return detailsCard('Custom door effects (advanced)', status,
-    h('p', { class: 'hint' }, 'Experimental: configure while parked. Native welcome and A/C overlays have priority. The provisional door mapping and receiver priority still need checking on the car. Settings stay in controller RAM until its next restart; preferences are saved on this phone. This version does not add a leaving animation.'),
+    h('p', { class: 'hint' }, 'Experimental: configure while parked. Native welcome and A/C overlays have priority. Settings stay in controller RAM until its next restart; preferences are saved on this phone. This version does not add a leaving animation.'),
     h('div', { class: 'field' }, h('label', {}, 'Door warning color'), color),
     h('div', { class: 'field' }, h('label', {}, 'Effect'), effect),
     h('div', { class: 'field' }, h('label', {}, 'Brightness limit (%) — also follows native dimming'), brightness),
     h('div', { class: 'field' }, h('label', {}, 'Effect cycle'), period),
     h('details', {}, h('summary', {}, 'Map doors and animation direction'),
-      h('p', { class: 'hint' }, 'To identify a channel, tick only that channel, apply, and open doors one at a time to see which strip lights. Open one door and read status to identify its signal bit (1, 2, 4, or 8). Assign each of the four signals once; the default mapping is provisional.'), ...mappingRows),
+      h('p', { class: 'hint' }, 'The default order was measured on the car: C0 rear left, C1 front left, C2 front right, C3 rear right. To check a channel, tick only that channel, apply, and open doors one at a time. Open one door and read status to see its signal bit (1, 2, 4, or 8). Assign each of the four signals once.'), ...mappingRows),
     apply, read, stop,
     h('p', { class: 'hint' }, 'Disable ends automatic effects. After closing a door, the controller sends a flat native-color hand-back while normal animation packets continue; exact receiver restoration still needs verification.'));
 }
