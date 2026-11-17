@@ -4,6 +4,8 @@ import {
   inspectFirmware, otaBlocks, otaLengthPayload, KNOWN_FIRMWARE,
 } from './protocol.js';
 import { Link, WebBluetoothTransport, DemoTransport, describeError } from './transport.js';
+import { OtaTransfer } from './ota-transfer.js';
+import { DiagnosticLog } from './diagnostics.js';
 
 // ---------------------------------------------------------------------------
 // tiny DOM + state helpers
@@ -34,6 +36,10 @@ const store = {
 };
 
 const emptySlots = () => Array(8).fill(PALETTE_EMPTY);
+const diagnostics = new DiagnosticLog({
+  getItem: key => localStorage.getItem(key),
+  setItem: (key, value) => localStorage.setItem(key, value),
+});
 
 const state = {
   connected: false, connecting: false, demo: false, tab: 'rgb', gen: 2,
@@ -54,9 +60,9 @@ const state = {
   version: {}, statusSeen: false,
   fwName: { status: 'idle', name: null, raw: null, at: null }, // idle | waiting | done | timeout | unsupported
   // firmware update. phase: idle | loaded | asking | entering | sending | verifying | done | failed | stalled
-  ota: { phase: 'idle', fileName: '', file: null, check: null, sha: '', known: null, block: 0, total: 0, message: '', pieceMode: 'auto', oldSoftware: '' },
+  ota: { phase: 'idle', fileName: '', file: null, check: null, sha: '', known: null, block: 0, total: 0, message: '', pieceMode: '20', oldSoftware: '', progress: {} },
   factory: { active: false, edit: false, dial: null, draftDial: null, lamps: null, draftLamps: null, result: null },
-  log: [],
+  log: diagnostics.entries,
   scenesEdit: false,
 };
 
@@ -88,6 +94,7 @@ function send(payload, key) {
     addLog('err', `Refused to send <${payload}> (firmware-update command)`);
     return false;
   }
+  if (link.otaLock) { toast('Update recovery is locked. Use the firmware update card.'); return false; }
   return link.send(payload, { key });
 }
 
@@ -105,15 +112,32 @@ let otaTimer = null;
 let otaBlocksList = [];
 let otaPiece = 0; // 0 = whole 200-byte block per write (as the vendor app); else split size
 let otaWakeLock = null;
-const OTA_ACTIVE = ['asking', 'retrying', 'entering', 'sending', 'verifying'];
+let otaLoadGeneration = 0;
+const OTA_ACTIVE = ['asking', 'retrying', 'entering', 'sending', 'verifying', 'waiting'];
+const otaTransfer = new OtaTransfer(link, {
+  onProgress: progress => {
+    otaSet({ progress, block: progress.transferPhase === 'complete' ? progress.totalBlocks : Math.max(0, progress.currentBlock - 1) });
+    if (progress.transferPhase === 'complete' || (progress.transferPhase === 'waiting-ack' && progress.writtenBlocks % 50 === 0)) diagnostics.update(otaSnapshot());
+  },
+  onStall: message => otaFail(message, 'stalled'),
+  onComplete: () => { otaClearTimer(); otaVerify(); },
+});
 
 function otaSet(patch) { set({ ota: { ...state.ota, ...patch } }); }
-function otaLog(text) { addLog('dim', `OTA: ${text}`); }
+function otaSnapshot() {
+  const o = state.ota;
+  return { phase: o.phase, message: o.message, fileName: o.fileName, bytes: o.file?.length || 0, sha256: o.sha,
+    expectedSoftware: o.expectedSoftware || '', oldSoftware: o.oldSoftware, pieceMode: o.pieceMode,
+    progress: o.progress, locked: link.otaLock, connected: link.connected, device: link.name,
+    visibility: document.visibilityState, writeMode: lastTransport?.writeMode || 'unknown' };
+}
+function otaLog(text) { addLog('dim', `OTA: ${text}`); diagnostics.update(otaSnapshot()); }
 function otaClearTimer() { clearTimeout(otaTimer); otaTimer = null; }
 function otaArm(ms, onTimeout) { otaClearTimer(); otaTimer = setTimeout(onTimeout, ms); }
 
 async function otaLoadFile(fileObj) {
   if (OTA_ACTIVE.includes(state.ota.phase)) return;
+  const generation = ++otaLoadGeneration;
   const buf = new Uint8Array(await fileObj.arrayBuffer());
   const check = inspectFirmware(buf);
   let sha = '';
@@ -121,21 +145,34 @@ async function otaLoadFile(fileObj) {
     const d = await crypto.subtle.digest('SHA-256', buf);
     sha = Array.from(new Uint8Array(d), (x) => x.toString(16).padStart(2, '0')).join('');
   } catch { sha = '(SHA-256 unavailable in this browser)'; }
+  if (generation !== otaLoadGeneration || OTA_ACTIVE.includes(state.ota.phase)) return;
   if (state.demo && lastTransport && check.info.embeddedName) lastTransport.otaName = check.info.embeddedName;
-  otaSet({ phase: 'loaded', fileName: fileObj.name, file: buf, check, sha, known: KNOWN_FIRMWARE[sha] || null, block: 0, total: Math.ceil(buf.length / 200), message: '' });
-  otaLog(`loaded ${fileObj.name}, ${buf.length} bytes, sha256 ${sha.slice(0, 16)}…, ${check.ok ? 'structure OK' : 'INVALID'}`);
+  const build = check.info.build?.match(/(\d{4})-(\d{2})-(\d{2})-(\d{3})/);
+  const expectedSoftware = build ? `${build[1].slice(-2)}${build[2]}${build[3]}-${build[4]}` : '';
+  otaSet({ phase: 'loaded', fileName: fileObj.name, file: buf, check, sha, known: KNOWN_FIRMWARE[sha] || null, block: 0, total: Math.ceil(buf.length / 200), message: '', progress: {}, expectedSoftware });
+  otaLog(`loaded ${fileObj.name}, ${buf.length} bytes, sha256 ${sha}, ${check.ok ? 'structure OK' : 'INVALID'}`);
 }
 
 function otaFail(message, phase = 'failed') {
   otaClearTimer();
-  if (phase === 'failed') { link.otaLock = false; otaReleaseWake(); }
+  if (state.ota.phase === 'sending') otaSet({ progress: { ...otaTransfer.progress, elapsedMs: Date.now() - otaTransfer.started } });
+  otaTransfer.cancel();
+  otaReleaseWake();
+  if (phase === 'failed') link.otaLock = false;
   otaSet({ phase, message });
-  otaLog(`${phase.toUpperCase()}: ${message}`);
+  const p = state.ota.progress;
+  otaLog(`${phase.toUpperCase()}: ${message} Last block attempted ${p.currentBlock || 0}/${state.ota.total}; completed writes ${p.writtenBlocks || 0}, controller ACKs ${p.acknowledgedBlocks || 0}, completed-block bytes ${p.bytesWritten || 0}, current-block bytes ${p.currentBlockWritten || 0}.`);
   toast(message, 6000);
 }
 
 async function otaAcquireWake() {
-  try { otaWakeLock = await navigator.wakeLock?.request('screen'); } catch { otaWakeLock = null; }
+  if (otaWakeLock && !otaWakeLock.released) return;
+  const run = otaTransfer.run;
+  try {
+    const lock = await navigator.wakeLock?.request('screen');
+    if (run !== otaTransfer.run || !OTA_ACTIVE.includes(state.ota.phase)) { lock?.release(); return; }
+    otaWakeLock = lock;
+  } catch { otaWakeLock = null; }
 }
 function otaReleaseWake() { try { otaWakeLock?.release(); } catch { /* ignore */ } otaWakeLock = null; }
 
@@ -143,47 +180,37 @@ function otaReleaseWake() { try { otaWakeLock?.release(); } catch { /* ignore */
 function otaBegin() {
   const o = state.ota;
   if (!link.connected) { toast('Not connected'); return; }
+  if (OTA_ACTIVE.includes(o.phase)) return;
   if (!o.check?.ok) { toast('This file failed the checks'); return; }
+  if (link.otaLock) { otaRetry(); return; }
+  otaTransfer.cancel();
   otaBlocksList = otaBlocks(o.file);
   otaPiece = o.pieceMode === 'auto' ? 0 : Number(o.pieceMode);
-  otaSet({ phase: 'asking', retry: false, message: 'Asking the box for its firmware file name…', block: 0, total: otaBlocksList.length, oldSoftware: state.version.software || '' });
-  otaLog(`start: ${otaBlocksList.length} blocks, piece size ${otaPiece || 'whole block'}`);
+  link.otaLock = true;
+  otaSet({ phase: 'asking', retry: false, message: 'Asking the box for its firmware file name…', block: 0, total: otaBlocksList.length, oldSoftware: state.version.software || '', progress: {} });
+  otaLog(`start: ${otaBlocksList.length} blocks, piece size ${otaPiece || 'whole block'}; file ${o.fileName}, bytes ${o.file.length}, sha256 ${o.sha}; ${navigator.userAgent}; visibility ${document.visibilityState}; write ${lastTransport?.writeMode || 'unknown'}`);
   link.send(FIRMWARE_NAME_QUERY, { ota: true });
-  otaArm(5000, () => otaFail('The box did not answer the file-name query. Nothing was changed.'));
+  otaArm(5000, () => otaFail('The box did not answer the file-name query. No update request was sent.'));
 }
 
 /** Step 2: send <0E…>; the box resets into its bootloader and answers <14>. */
 function otaEnterBootloader() {
   link.otaLock = true;
-  otaAcquireWake();
   otaSet({ phase: 'entering', message: 'Box is restarting into update mode…' });
+  otaAcquireWake();
   link.send(otaLengthPayload(state.ota.file.length), { ota: true });
   otaArm(20000, () => otaFail('No <14> from the box within 20 s. It may still be running its normal firmware: switch the ignition off and on, reconnect and check the version.', 'stalled'));
 }
 
-async function otaSendBlock(i) {
-  otaClearTimer();
-  otaSet({ phase: 'sending', block: i, message: `Sending block ${i + 1} of ${otaBlocksList.length}…` });
-  let ok = await link.sendRaw(otaBlocksList[i], { pieceSize: otaPiece });
-  if (!ok && state.ota.pieceMode === 'auto' && otaPiece === 0 && i === 0) {
-    // the phone refused a 200-byte write (small BLE MTU): nothing reached the box, retry block 0 in 100-byte pieces
-    otaPiece = 100;
-    otaLog('200-byte write refused by the phone, retrying block 1 in 100-byte pieces');
-    ok = await link.sendRaw(otaBlocksList[i], { pieceSize: otaPiece });
-  }
-  if (!ok) { otaFail(`Write failed at block ${i + 1}. The box is now waiting in update mode. See “If it stops”.`, 'stalled'); return; }
-  if (i === otaBlocksList.length - 1) { otaVerify(); return; }
-  otaArm(8000, () => otaFail(`No <16> after block ${i + 1} of ${otaBlocksList.length}. The box is waiting in update mode. See “If it stops”.`, 'stalled'));
-}
-
 /** After the last block: give the bootloader time to finish, then ask the new firmware for its version. */
 function otaVerify() {
-  otaSet({ phase: 'verifying', block: otaBlocksList.length, message: 'All blocks sent. Waiting for the box to restart…' });
+  otaSet({ phase: 'verifying', verificationQuerySent: false, block: otaBlocksList.length, message: 'All blocks sent. Waiting for the box to restart…' });
+  otaLog('all block writes completed; waiting for a fresh version reply');
   let tries = 0;
   const poll = () => {
     if (state.ota.phase !== 'verifying') return;
     if (tries++ >= 8) {
-      otaFail('All data was sent, but the box did not report a version afterwards. Switch the ignition off and on, reconnect, and check Device → Controller.', 'stalled');
+      otaFail('All block writes completed, but no fresh version reply was received. Installation is not confirmed. Reconnect and copy the Bluetooth log.', 'stalled');
       return;
     }
     link.send('0A01', { ota: true });
@@ -218,20 +245,33 @@ function otaOnFrame(f) {
   }
   if (o.phase === 'entering' && f.type === 'firmwareName' && f.raw === '1502') {
     if (o.retry) { otaRetryRefused(); return true; }
-    otaFail('The box refused the update: same length as its last update (this version is probably already installed). Nothing was changed.');
+    otaFail('The controller refused the update (<1502>). The refusal does not establish its cause or confirm the installed version.');
     return true;
   }
-  if (['entering', 'stalled', 'retrying'].includes(o.phase) && f.type === 'otaStart') { otaClearTimer(); otaLog('<14> bootloader ready'); otaSendBlock(0); return true; }
+  if (['entering', 'waiting', 'retrying'].includes(o.phase) && f.type === 'otaStart') {
+    otaClearTimer(); otaLog('<14> bootloader ready');
+    otaSet({ phase: 'sending', message: 'Sending firmware blocks…' });
+    otaTransfer.start(otaBlocksList, otaPiece);
+    otaAcquireWake();
+    return true;
+  }
   if (o.phase === 'sending' && f.type === 'otaNext') {
-    if (o.block + 1 < otaBlocksList.length) otaSendBlock(o.block + 1);
+    otaTransfer.ack();
     return true;
   }
-  if (o.phase === 'verifying' && f.type === 'version') {
+  if (o.phase === 'verifying' && o.verificationQuerySent && f.type === 'version') {
     otaClearTimer();
     link.otaLock = false;
     otaReleaseWake();
-    otaSet({ phase: 'done', message: `Update finished. The box now reports software ${f.software || '?'} (before: ${o.oldSoftware || '?'}).` });
-    otaLog(`done, software ${o.oldSoftware} -> ${f.software}`);
+    if (o.expectedSoftware && f.software !== o.expectedSoftware) {
+      otaSet({ phase: 'failed', message: `The controller reports ${f.software || '?'}, but the selected file is expected to report ${o.expectedSoftware}. Installation of the selected build is not confirmed.` });
+      otaLog(`VERSION MISMATCH: expected ${o.expectedSoftware}, received ${f.software}`);
+      return false;
+    }
+    otaSet({ phase: 'done', message: o.expectedSoftware
+      ? `Update finished. The box now reports software ${f.software || '?'} (before: ${o.oldSoftware || '?'}).`
+      : `The controller reports software ${f.software || '?'}. A build marker was not detected in the selected file, so its installation identity is unverified.` });
+    otaLog(`done, software ${o.oldSoftware} -> ${f.software}${o.expectedSoftware ? '' : '; selected build identity unverified'}`);
     return false; // let the normal handler store the version too
   }
   return false;
@@ -244,14 +284,16 @@ function otaOnFrame(f) {
  */
 function otaRetry() {
   const o = state.ota;
+  if (OTA_ACTIVE.includes(o.phase)) return;
   if (!o.file || !o.check?.ok) { toast('Pick the firmware file again first'); return; }
   if (!link.connected) { toast('Reconnect to the box first'); return; }
+  otaTransfer.cancel();
   otaBlocksList = otaBlocks(o.file);
   otaPiece = o.pieceMode === 'auto' ? 0 : Number(o.pieceMode);
   if (state.demo && lastTransport && o.check.info.embeddedName) lastTransport.otaName = o.check.info.embeddedName;
   link.otaLock = true;
+  otaSet({ phase: 'retrying', retry: true, block: 0, progress: {}, message: 'Retrying from the start: asking the box for its file name…' });
   otaAcquireWake();
-  otaSet({ phase: 'retrying', retry: true, block: 0, message: 'Retrying from the start: asking the box for its file name…' });
   otaLog('retry from the start');
   link.send(FIRMWARE_NAME_QUERY, { ota: true });
   otaArm(4000, () => {
@@ -262,24 +304,29 @@ function otaRetry() {
   });
 }
 
-/** The normal firmware is running again and remembers this length from the interrupted attempt. */
+/** A refusal does not identify its cause or establish what firmware is running. */
 function otaRetryRefused() {
   otaClearTimer();
   link.otaLock = false;
   otaReleaseWake();
-  otaSet({ phase: 'failed', message: 'The box is running its normal firmware again and refuses the same file a second time (it remembers this length from the interrupted attempt). Nothing is broken: the lights should work as before. A full retry needs the vendor app or a file of a different length.' });
-  otaLog('retry refused with <1502>: old firmware running, same length remembered');
+  otaSet({ phase: 'failed', message: 'The controller refused the update (<1502>). Some older firmware rejects a repeated file length; that restriction is absent from the traced File122 application. Copy the log and check the reported version before choosing a next step.' });
+  otaLog('retry refused with <1502>; cause and installed build not established');
 }
 
 /** Manual recovery after a stall: wait for the bootloader's <14> again (sent e.g. after a power cycle). */
 function otaWaitForBootloader() {
+  if (!state.ota.check?.ok || !link.connected) { toast('Load a valid file and reconnect first'); return; }
+  otaBlocksList = otaBlocks(state.ota.file);
+  otaPiece = state.ota.pieceMode === 'auto' ? 0 : Number(state.ota.pieceMode);
   link.otaLock = true;
-  otaSet({ phase: 'stalled', message: 'Waiting for <14> from the bootloader… Switch the ignition off and on, then reconnect if needed.' });
+  otaSet({ phase: 'waiting', message: 'Waiting for <14> from the bootloader. No firmware data is sent until it arrives.' });
   otaLog('waiting for <14> (manual recovery)');
 }
 
 function otaStopAndUnlock() {
   otaClearTimer();
+  if (state.ota.phase === 'sending') otaSet({ progress: { ...otaTransfer.progress } });
+  otaTransfer.cancel();
   link.otaLock = false;
   otaReleaseWake();
   otaSet({ phase: state.ota.file ? 'loaded' : 'idle', message: '' });
@@ -287,8 +334,10 @@ function otaStopAndUnlock() {
 }
 
 link.addEventListener('tx-raw', (e) => {
-  const o = state.ota;
-  if (o.block % 50 === 0 || o.block >= o.total - 1 || !e.detail.ok) addLog('tx', `[firmware block ${o.block + 1}/${o.total}: ${e.detail.length} bytes${e.detail.ok ? '' : ', FAILED'}]`);
+  const d = e.detail;
+  if ((d.block - 1) % 50 === 0 || d.block === d.total || !d.ok) {
+    addLog('tx', `[firmware block ${d.block}/${d.total}: ${d.written}/${d.length} bytes written${d.ok ? '' : ', FAILED'}]${d.error ? ' ' + d.error : ''}`);
+  }
 });
 link.addEventListener('state', (e) => {
   if (!e.detail.connected && OTA_ACTIVE.includes(state.ota.phase)) {
@@ -301,25 +350,36 @@ let fwTimer;
 /** One-shot, confirmed query for the firmware file name (sends 0DBB44 only; 0E stays blocked). */
 function readFirmwareName() {
   if (!link.connected) { toast('Not connected'); return; }
+  if (link.otaLock || OTA_ACTIVE.includes(state.ota.phase)) {
+    addLog('dim', 'Firmware name query blocked locally by the update lock; nothing sent. Use the update recovery card.');
+    toast('Update recovery is locked. Use the firmware update card.');
+    return;
+  }
   if (state.fwName.status === 'waiting') return;
   if (!confirm('Ask the controller for its firmware file name?\n\n'
     + 'This sends one command, <0DBB44>: the first step of the vendor’s update, which only makes the box reply with a file name. '
     + 'This app never sends the next step (0E), so nothing is downloaded to the box or written to it.\n\n'
     + 'Do this with the car parked. Afterwards, switch the ignition off and let the box go to sleep before driving.')) return;
   set({ fwName: { status: 'waiting', name: null, raw: null, at: null } });
-  addLog('dim', 'Firmware name query: sending <0DBB44> once; 0D/0E stay blocked everywhere else');
-  link.send(FIRMWARE_NAME_QUERY);
+  if (!link.send(FIRMWARE_NAME_QUERY)) {
+    set({ fwName: { ...state.fwName, status: 'idle' } });
+    addLog('err', 'Firmware name query was not queued; nothing sent.');
+    return;
+  }
+  addLog('dim', 'Firmware name query queued once; the tx entry records the write attempt.');
   clearTimeout(fwTimer);
   fwTimer = setTimeout(() => { if (state.fwName.status === 'waiting') set({ fwName: { ...state.fwName, status: 'timeout' } }); }, 3000);
 }
 
 function addLog(kind, text, note = '') {
-  state.log.push({ kind, text, note, t: new Date() });
-  if (state.log.length > 300) state.log.splice(0, state.log.length - 300);
+  diagnostics.add(kind, text, note);
   renderLog();
 }
 
-link.addEventListener('tx', (e) => addLog('tx', `<${e.detail.payload}>`));
+link.addEventListener('tx', (e) => {
+  if (state.ota.phase === 'verifying' && e.detail.payload === '0A01') otaSet({ verificationQuerySent: true });
+  addLog('tx', `<${e.detail.payload}>`);
+});
 link.addEventListener('error', (e) => { addLog('err', e.detail.message); toast(e.detail.message); });
 link.addEventListener('frame', (e) => {
   const f = parseFrame(e.detail.payload);
@@ -1008,7 +1068,7 @@ function buildLab() {
 // device / installer
 // ---------------------------------------------------------------------------
 
-let logPre;
+let logPre, logCard, otaCard, offlineTools, deviceTools;
 function renderLog() {
   if (!logPre || logPre.closest('details')?.open === false) return;
   const fmt = (d) => d.toTimeString().slice(0, 8);
@@ -1198,7 +1258,7 @@ function buildDevice() {
   const fwOut = h('div');
   bind(() => {
     const s = state.fwName;
-    fwBtn.disabled = s.status === 'waiting';
+    fwBtn.disabled = !state.connected || link.otaLock || OTA_ACTIVE.includes(state.ota.phase) || s.status === 'waiting';
     fwBtn.textContent = s.status === 'waiting' ? 'Waiting for reply…' : 'Read firmware file name';
     if (s.status === 'done') {
       fwOut.replaceChildren(
@@ -1222,7 +1282,7 @@ function buildDevice() {
   });
   const fwCard = detailsCard('Firmware file name',
     h('p', { class: 'hint' }, 'Reads the name of the firmware file this controller uses, so it can be downloaded and studied on a computer. Read-only: the app sends only the first step of the vendor update (0DBB44). It never sends the step that starts an update.'),
-    fwBtn, fwOut);
+    h('p', { class: 'hint' }, 'During update recovery this standalone query is locked. Use the firmware update card to retry.'), fwBtn, fwOut);
 
   // --- firmware update (OTA)
   const otaInput = h('input', { type: 'file', accept: '.bin,application/octet-stream', class: 'input', onchange: () => { if (otaInput.files?.[0]) otaLoadFile(otaInput.files[0]); } });
@@ -1232,9 +1292,9 @@ function buildDevice() {
   const otaAckUnknownRow = h('label', { class: 'check' }, otaAckUnknown, 'This is NOT a known vendor file. I accept that the box may reject it or stay in update mode until a valid file is sent.');
   const otaConfirm = h('input', { type: 'text', class: 'input', placeholder: 'type UPDATE', autocapitalize: 'characters', autocomplete: 'off', spellcheck: false, oninput: () => refresh() });
   const otaPieceSel = h('select', { class: 'input', onchange: () => otaSet({ pieceMode: otaPieceSel.value }) },
-    h('option', { value: 'auto' }, 'Auto: 200-byte writes like the vendor app, 100 if the phone refuses'),
+    h('option', { value: '20' }, '20-byte pieces (tested on this controller)'),
     h('option', { value: '100' }, '100-byte pieces'),
-    h('option', { value: '20' }, '20-byte pieces (slowest, smallest packets)'));
+    h('option', { value: 'auto' }, 'Whole 200-byte blocks'));
   const otaStartBtn = h('button', { class: 'btn danger block', type: 'button', onclick: otaBegin }, 'Start firmware update');
   const otaStopBtn = h('button', { class: 'btn block', type: 'button', onclick: otaStopAndUnlock }, 'Stop and unlock normal commands');
   const otaWaitBtn = h('button', { class: 'btn block', type: 'button', onclick: otaWaitForBootloader }, 'Wait for the box (<14>) and restart from block 1');
@@ -1268,41 +1328,51 @@ function buildDevice() {
     otaAckUnknownRow.hidden = !c || !!o.known;
     otaSetup.hidden = running || o.phase === 'stalled';
     otaInput.disabled = running;
+    otaPieceSel.value = o.pieceMode;
+    otaPieceSel.disabled = running;
     otaStartBtn.disabled = !c?.ok || !o.ack || (!o.known && !o.ackUnknown) || !typed || !link.connected || running;
-    otaStopBtn.hidden = !(running || o.phase === 'stalled');
+    otaStartBtn.textContent = link.otaLock ? 'Retry firmware update from the start' : 'Start firmware update';
+    otaStopBtn.hidden = !(running || o.phase === 'stalled' || link.otaLock);
     otaWaitBtn.hidden = o.phase !== 'stalled';
+    otaWaitBtn.disabled = !link.connected || !c?.ok;
     otaRetryBtn.hidden = o.phase !== 'stalled';
-    otaRetryBtn.disabled = !link.connected;
+    otaRetryBtn.disabled = !link.connected || !c?.ok;
     otaProgress.hidden = !(running || ['stalled', 'done'].includes(o.phase));
     otaProgress.max = String(Math.max(1, o.total));
     otaProgress.value = String(o.phase === 'done' ? o.total : o.block);
-    otaMsg.textContent = o.message || '';
+    const p = o.progress;
+    otaMsg.textContent = (o.message || '') + (p.currentBlock ? ` Block ${p.currentBlock}/${o.total}; ${p.writtenBlocks} blocks written, ${p.acknowledgedBlocks} controller ACKs; ${Math.round((p.elapsedMs || 0) / 1000)} s elapsed.` : '');
     otaMsg.className = o.phase === 'failed' || o.phase === 'stalled' ? 'banner warn' : 'hint';
   });
   otaSetup.append(
     h('label', { class: 'check', style: { 'margin-top': '10px' } }, otaAck,
-      'Car parked, ignition on (engine running is best), phone charged and next to the box. I will keep this page open in the foreground until it finishes.'),
+      'Car parked, controller power maintained throughout the update, phone charged and next to the box. I will keep this page open in the foreground until it finishes.'),
     otaAckUnknownRow,
-    h('div', { class: 'field' }, h('label', {}, 'Block writes'), otaPieceSel),
     h('div', { class: 'field' }, h('label', {}, 'Type UPDATE to enable the button'), otaConfirm),
     otaStartBtn);
-  const otaCard = detailsCard('Firmware update (experimental)',
+  otaCard = detailsCard('Firmware update (experimental)',
     h('div', { class: 'banner warn' },
       'This writes new firmware into the controller, using the same procedure as the vendor app (reverse engineered; their bootloader could not be inspected). ',
       'A failed or interrupted update can leave the box waiting in update mode. Only use a file downloaded from the vendor for your box’s exact file name.'),
     otaIosWarn,
+    h('p', { class: 'hint' }, 'Ignition on is a precaution against the controller losing power, not a requirement of the update command. Ignition-off recovery has worked on the tested installation. The radio being on alone does not confirm that the lighting controller will remain powered; this depends on its wiring and sleep behavior.'),
+    h('p', { class: 'hint' }, h('b', {}, 'Before you start: '), 'the update resets your light settings (colours, effects, light bar options). Take screenshots of the Car and Light tabs, and of the installer “Backup” box, so you can set everything up again afterwards.'),
     h('p', { class: 'hint' }, '1. Get the file (e.g. File122.bin) onto this phone. The app cannot download it: the vendor server blocks browsers, and the app makes no network requests. 2. Pick it below; the app checks it. 3. The app asks the box for its file name and refuses if it does not match the file.'),
-    otaInput, otaFileInfo, otaSetup, otaProgress, otaMsg, otaRetryBtn, otaWaitBtn, otaStopBtn,
+    otaInput, otaFileInfo, h('div', { class: 'field' }, h('label', {}, 'Block writes'), otaPieceSel), otaSetup, otaProgress, otaMsg, otaRetryBtn, otaWaitBtn, otaStopBtn,
     h('details', { style: { 'margin-top': '8px' } }, h('summary', {}, 'If it stops'),
       h('p', { class: 'hint' }, 'The vendor’s recovery procedure: switch the car off, cut the control box’s main power for about a minute (unplug its power connector, or pull the fuse it is wired to), reconnect power, reconnect in this app, and tap “Retry from the start”. The app asks the box for its name. If the normal firmware answers, the update runs again from the beginning. If the box stays silent (waiting in update mode), the app sends the update request directly. Try 100- or 20-byte pieces if it stalls at the very start. Copy the Bluetooth log and keep it.'),
       h('p', { class: 'hint' }, '“Wait for the box” only listens for the box asking for block 1 (<14>), without sending anything.')));
 
   // --- log + console
   logPre = h('pre', { class: 'log' });
-  const logCard = detailsCard('Bluetooth log', logPre,
+  const storageStatus = h('p', { class: 'hint' });
+  bind(() => { storageStatus.textContent = diagnostics.persistent === false ? 'Browser storage is unavailable. Copy or save the report before closing this page.' : ''; });
+  logCard = detailsCard('Bluetooth log',
+    h('p', { class: 'hint' }, 'Available while disconnected. The latest 400 entries and update summary are saved on this phone when browser storage is available. Save a report before clearing browser data.'), storageStatus, logPre,
     h('div', { class: 'row', style: { 'margin-top': '8px' } },
-      h('button', { class: 'btn small ghost', type: 'button', onclick: () => { state.log = []; renderLog(); } }, 'Clear'),
-      h('button', { class: 'btn small ghost', type: 'button', onclick: () => copyText(state.log.map((e) => `${e.kind} ${e.text} ${e.note}`).join('\n')) }, 'Copy')));
+      h('button', { class: 'btn small ghost', type: 'button', onclick: () => { diagnostics.clear(); renderLog(); } }, 'Clear'),
+      h('button', { class: 'btn small ghost', type: 'button', onclick: () => copyText(diagnostics.text()) }, 'Copy'),
+      h('button', { class: 'btn small ghost', type: 'button', onclick: saveDiagnosticReport }, 'Save report')));
   logCard.addEventListener('toggle', renderLog);
 
   const raw = h('input', { type: 'text', class: 'input', placeholder: 'e.g. 0701', autocapitalize: 'characters', autocomplete: 'off', spellcheck: false });
@@ -1316,19 +1386,32 @@ function buildDevice() {
     h('p', { class: 'hint' }, 'Sends <payload> exactly like the official app’s debug screen (PIN 6666). Firmware-update and import commands are blocked.'),
     h('div', { class: 'row' }, h('div', { class: 'grow' }, raw), h('button', { class: 'btn primary', type: 'button', onclick: sendRaw }, 'Send')));
 
+  deviceTools = h('div', {}, otaCard, logCard);
+  offlineTools = h('div', { id: 'offline-tools' });
+  $('#view-connect').append(offlineTools);
   v.append(
     card('Controller', null, kv,
       h('div', { class: 'row', style: { 'margin-top': '12px' } },
         h('button', { class: 'btn', type: 'button', onclick: () => send(Cmd.hello()) }, 'Refresh state'),
         h('button', { class: 'btn danger', type: 'button', onclick: async () => { factoryExit(); await new Promise((r) => setTimeout(r, 150)); link.disconnect(); } }, 'Disconnect'))),
-    installer, fwCard, otaCard, logCard, consoleCard,
+    installer, fwCard, deviceTools, consoleCard,
     card('About', null, h('p', { class: 'hint', style: { margin: 0 } },
-      'Independent controller built from a protocol analysis of the vendor app. It makes no network requests and stores only your scenes and the name prefix on this phone. Not affiliated with the hardware vendor.')),
+      'Independent controller built from a protocol analysis of the vendor app. It makes no network requests and saves scenes, connection preferences and recent Bluetooth diagnostics on this phone. Not affiliated with the hardware vendor.')),
   );
 }
 
 async function copyText(text) {
   try { await navigator.clipboard.writeText(text); toast('Copied'); } catch { toast('Copy not allowed here — select the text instead'); }
+}
+
+function saveDiagnosticReport() {
+  const report = diagnostics.report({ app: 'ambient-lights-uploader-2', userAgent: navigator.userAgent,
+    visibility: document.visibilityState, connected: link.connected, device: link.name,
+    version: state.version, writeMode: lastTransport?.writeMode || 'unknown', storageAvailable: !!diagnostics.persistent });
+  const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' }));
+  const anchor = h('a', { href: url, download: `ambient-lights-report-${new Date().toISOString().replace(/[:.]/g, '-')}.json` });
+  document.body.append(anchor); anchor.click(); anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 // ---------------------------------------------------------------------------
@@ -1347,6 +1430,10 @@ function showTab(tab) {
 
 function renderShell() {
   const connected = state.connected;
+  if (offlineTools && deviceTools) {
+    const host = connected ? deviceTools : offlineTools;
+    for (const card of [otaCard, logCard]) if (card.parentNode !== host) host.append(card);
+  }
   $('#view-connect').hidden = connected;
   for (const t of TABS) $(`#view-${t}`).hidden = !connected || state.tab !== t;
   for (const b of document.querySelectorAll('#tabbar button')) {
@@ -1358,6 +1445,12 @@ function renderShell() {
 }
 
 function init() {
+  const saved = diagnostics.lastUpdate;
+  if (saved && (saved.locked || ['retrying', 'entering', 'sending', 'verifying', 'waiting', 'stalled'].includes(saved.phase))) {
+    link.otaLock = true;
+    otaSet({ phase: 'stalled', message: 'A previous update was interrupted or unverified. Re-select the firmware file, reconnect and explicitly retry from the start. The saved report is available below.',
+      fileName: saved.fileName || '', total: saved.progress?.totalBlocks || 0, progress: saved.progress || {} });
+  }
   buildConnect();
   buildRgb();
   buildFlow();
@@ -1367,8 +1460,15 @@ function init() {
   state.tab = TABS.includes(store.get('tab', 'rgb')) ? store.get('tab', 'rgb') : 'rgb';
   for (const b of document.querySelectorAll('#tabbar button')) b.addEventListener('click', () => showTab(b.dataset.tab));
   // leave installer mode if the page is hidden/closed
-  document.addEventListener('visibilitychange', () => { if (document.hidden) factoryExit(); });
-  window.addEventListener('pagehide', factoryExit);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) factoryExit();
+    if (OTA_ACTIVE.includes(state.ota.phase) || state.ota.phase === 'stalled') {
+      otaLog(`page visibility changed to ${document.visibilityState}`);
+      if (!document.hidden && state.ota.phase !== 'stalled') otaAcquireWake();
+    }
+  });
+  window.addEventListener('pagehide', () => { factoryExit(); if (OTA_ACTIVE.includes(state.ota.phase)) otaLog('page hidden/closed during update; automatic resume is disabled'); });
+  if (diagnostics.entries.length) addLog('dim', 'Page opened; previous diagnostics restored. No update is resumed automatically.');
   renderShell();
   if (new URLSearchParams(location.search).has('demo')) connect({ demo: true });
 }

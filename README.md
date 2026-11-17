@@ -1,6 +1,6 @@
 # Ambient Lights
 
-An independent controller for the LOMO / lmyiot car ambient-light box (sold with the "carLight" / "Car ambient light controller" app). It's a single web page that talks to the box over **Web Bluetooth**. There's no account, no server and no tracking. It makes no network requests at all, and only your saved scenes and the name prefix stay on the phone, in local storage.
+An independent controller for the LOMO / lmyiot car ambient-light box (sold with the "carLight" / "Car ambient light controller" app). It's a single web page that talks to the box over **Web Bluetooth**. There's no account, no server and no tracking. It makes no network requests at all. Scenes, connection preferences and recent Bluetooth diagnostics stay on the phone, in local storage when available.
 
 The protocol was reconstructed from the vendor Android app (v1.81.3); see [carlight-protocol.md](carlight-protocol.md). The security review is in [carlight-findings.md](carlight-findings.md).
 
@@ -70,9 +70,22 @@ Deliberately **not** included: key learning, light-parameter import, customer-co
 
 ## Firmware update (experimental)
 
-Device → **Firmware update** uses the same procedure as the vendor app (see `carlight-protocol.md` §7). The vendor's bootloader could not be inspected, so treat it as risky:
+Device → **Firmware update** uses the same procedure as the vendor app (see `carlight-protocol.md` §7).
+
+The updater defaults to 20-byte pieces. It records the selected file's full SHA-256, browser/write mode, block-write and controller-acknowledgement counters, partial-block write progress, and page visibility changes. A write error stops the transfer; it never retries a potentially partial block automatically at a different size. Fast acknowledgements wait for the pending write to finish, and cancelled or disconnected transfers cannot continue writing through a new connection. A fresh version reply must match the selected file's detected build when that build is available.
+
+**Bluetooth log** and the update recovery card also appear on the disconnected connection screen. Copy includes timestamps; **Save report** downloads a JSON report with the latest 400 log entries and update summary. The report contains browser/device/version information but no firmware bytes. Browser storage preserves this evidence across refreshes when available. A refresh restores a pending recovery lock, never resumes an upload automatically, and requires re-selecting the file before an explicit retry. The standalone filename action reports when a query is blocked locally.
+
+**Tested on the real box (2026-11-16):**
+- File122.bin (V6.30, 2026-11-15) installed successfully from an Android 7.1.2 phone (Chrome 112), with **Block writes = 20-byte pieces**.
+- The bootloader accepts the blocks split into small packets.
+- The update **reset the light settings**, which had to be set up again. Back up first.
+- A subsequent marker-only custom File122 update also succeeded: a fresh Bluetooth reply confirmed **`261115-007` → `261115-070`**. The user reported no breakage. This verifies that specific same-size, checksum-preserving modification. On 2026-11-17, a larger `071` attempt disconnected before visible completion; reinstalling `070` succeeded with a fresh version reply and normal operation reported. This demonstrates recovery from that interruption, while complete `071` acceptance, rejected-image recovery and rollback from a running `071` remain untested.
+- On older Android phones, start with 20-byte pieces. On iPhone, the vendor says "change your phone".
+
+The vendor's bootloader could not be inspected, so it still carries some risk:
 - Use only the vendor file for your box's exact name. Device → Firmware file name shows the name; the file has to be downloaded on a computer and copied to the phone.
-- Car parked, ignition on (engine running is best), phone charged, page kept in the foreground. iOS pauses background pages, which would stall the transfer.
+- Car parked, controller power maintained throughout the update, phone charged, page kept in the foreground. Ignition on is a precaution against power loss, not a protocol requirement: the user completed the `070` recovery with ignition off. Whether the controller stays powered depends on its installation and sleep behavior; switching on the radio alone does not establish this. iOS pauses background pages, which would stall the transfer.
 - If it's interrupted, follow the vendor's recovery procedure: switch the car off, cut the control box's main power for about a minute (its power connector or fuse), reconnect, and tap "Retry from the start". The vendor's answer was "Update", meaning the box stays in update mode until a complete update has been installed. The app first asks for the file name. If there's no answer, it sends the update request directly and starts again from block 1.
 
 ## Not yet verified on the real box
@@ -83,4 +96,4 @@ The protocol comes from decompiled code and has only been tested against the bui
 - Whether Effect toggle (`29xx`) is reported back 0- or 1-based.
 - Mirror light and the "extra effects" may simply be unsupported on your box.
 
-If something misbehaves, open **Device → Bluetooth log**, tap **Copy** and share it.
+If something misbehaves, open **Bluetooth log** under Device or on the disconnected connection screen, then use **Copy** or **Save report**.

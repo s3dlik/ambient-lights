@@ -12,11 +12,12 @@ export class Link extends EventTarget {
     super();
     this.transport = null;
     this.queue = [];
-    this.busy = false;
     this.gapMs = 35;
     this.frames = new FrameBuffer();
     /** While true (firmware update running), only payloads sent with `{ ota: true }` and raw blocks go out. */
     this.otaLock = false;
+    this.session = 0;
+    this.pendingRaw = new Set();
   }
 
   get connected() { return !!this.transport?.connected; }
@@ -26,23 +27,38 @@ export class Link extends EventTarget {
     await this.disconnect();
     this.transport = transport;
     this.frames = new FrameBuffer();
+    const session = this.session;
     transport.onData = (bytes) => {
+      if (session !== this.session || this.transport !== transport) return;
       this.emit('rx-raw', { text: String.fromCharCode(...bytes) });
       for (const payload of this.frames.push(bytes)) this.emit('frame', { payload });
     };
-    transport.onDisconnect = () => { this.queue = []; this.emit('state', { connected: false }); };
+    transport.onDisconnect = () => {
+      if (session !== this.session || this.transport !== transport) return;
+      this.session++;
+      this.clearQueue();
+      for (const finish of [...this.pendingRaw]) finish(false);
+      this.emit('state', { connected: false });
+    };
     await transport.connect();
+    if (session !== this.session || this.transport !== transport || !transport.connected) throw new Error('Bluetooth connection ended during setup');
     this.emit('state', { connected: true, name: transport.name });
   }
 
   async disconnect() {
-    this.queue = [];
+    this.session++;
+    this.clearQueue();
+    for (const finish of [...this.pendingRaw]) finish(false);
     if (this.transport) {
       const t = this.transport;
       this.transport = null;
       try { await t.disconnect(); } catch { /* ignore */ }
       this.emit('state', { connected: false });
     }
+  }
+
+  clearQueue() {
+    for (const item of this.queue.splice(0)) item.resolve?.(false);
   }
 
   /** Queue a command payload (hex string without < >). */
@@ -53,7 +69,7 @@ export class Link extends EventTarget {
       const pending = this.queue.find((q) => q.key === key);
       if (pending) { pending.payload = payload; return true; }
     }
-    this.queue.push({ payload, key });
+    this.queue.push({ payload, key, ota, session: this.session });
     this.pump();
     return true;
   }
@@ -63,46 +79,64 @@ export class Link extends EventTarget {
    * pieceSize > 0 splits the block into several writes (for phones whose BLE MTU is below the block size).
    * Resolves to true when every piece was written, false on a write error (nothing retried here).
    */
-  sendRaw(bytes, { pieceSize = 0 } = {}) {
-    if (!this.connected) return Promise.resolve(false);
+  sendRaw(bytes, { pieceSize = 0, signal, meta = {} } = {}) {
+    if (!this.connected || signal?.aborted) return Promise.resolve(false);
     return new Promise((resolve) => {
-      this.queue.push({ raw: bytes, pieceSize, resolve });
+      const finish = (ok) => { this.pendingRaw.delete(finish); resolve(ok); };
+      this.pendingRaw.add(finish);
+      this.queue.push({ raw: bytes, pieceSize, resolve: finish, signal, meta, session: this.session });
       this.pump();
     });
   }
 
   async pump() {
-    if (this.busy) return;
-    this.busy = true;
+    const session = this.session;
+    if (this.pumpSession === session) return;
+    this.pumpSession = session;
     try {
-      while (this.queue.length && this.connected) {
+      while (this.queue.length && this.connected && session === this.session) {
         const item = this.queue.shift();
+        if (item.session !== this.session || item.signal?.aborted) { item.resolve?.(false); continue; }
+        const transport = this.transport;
+        const current = () => item.session === this.session && this.transport === transport && transport.connected && !item.signal?.aborted;
         if (item.raw) {
           const { raw, pieceSize, resolve } = item;
           const step = pieceSize > 0 ? pieceSize : raw.length;
           let ok = true;
+          let written = 0;
+          let error = '';
           try {
-            for (let i = 0; i < raw.length; i += step) await this.transport.write(raw.subarray(i, Math.min(raw.length, i + step)));
+            for (let i = 0; i < raw.length; i += step) {
+              if (!current()) throw new Error(item.signal?.aborted ? 'Transfer cancelled' : 'Bluetooth connection changed');
+              const piece = raw.subarray(i, Math.min(raw.length, i + step));
+              await transport.write(piece);
+              written += piece.length;
+              this.emit('raw-progress', { ...item.meta, written, length: raw.length });
+            }
+            if (!current()) throw new Error(item.signal?.aborted ? 'Transfer cancelled' : 'Bluetooth connection changed');
           } catch (e) {
             ok = false;
-            this.emit('error', { message: `Firmware block write failed: ${e.message || e}` });
+            error = describeError(e);
+            if (!item.signal?.aborted) this.emit('error', { message: `Firmware block write failed after ${written}/${raw.length} bytes: ${error}` });
           }
-          this.emit('tx-raw', { length: raw.length, ok });
+          this.emit('tx-raw', { ...item.meta, length: raw.length, written, ok, error, cancelled: !!item.signal?.aborted });
           resolve(ok);
         } else {
           const { payload } = item;
+          // Re-check at dequeue time: a normal command may have been queued before OTA locked the link.
+          if (this.otaLock && !item.ota) continue;
           this.emit('tx', { payload });
           try {
-            await this.transport.write(encodeFrame(payload));
+            await transport.write(encodeFrame(payload));
           } catch (e) {
             this.emit('error', { message: `Write failed: ${e.message || e}` });
           }
         }
         await new Promise((r) => setTimeout(r, this.gapMs));
       }
-      for (const item of this.queue.splice(0)) item.resolve?.(false); // disconnected: fail pending raw writes
+      if (session === this.session) this.clearQueue();
     } finally {
-      this.busy = false;
+      if (this.pumpSession === session) this.pumpSession = null;
     }
   }
 
@@ -159,6 +193,12 @@ export class WebBluetoothTransport {
 
   get connected() { return !!this.device?.gatt?.connected; }
   get name() { return this.device?.name || 'Controller'; }
+  get writeMode() {
+    const c = this.writeChar;
+    if (!c) return 'not connected';
+    if (c.properties?.writeWithoutResponse && c.writeValueWithoutResponse) return 'without response';
+    return c.writeValueWithResponse ? 'with response' : 'legacy writeValue';
+  }
 
   async step(name, fn) {
     this.onStep(name);
