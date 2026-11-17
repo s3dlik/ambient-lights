@@ -128,8 +128,9 @@ const otaTransfer = new OtaTransfer(link, {
 function otaSet(patch) { set({ ota: { ...state.ota, ...patch } }); }
 function otaSnapshot() {
   const o = state.ota;
-  return { phase: o.phase, message: o.message, fileName: o.fileName, bytes: o.file?.length || 0, sha256: o.sha,
+  return { phase: o.phase, message: o.message, fileName: o.fileName, bytes: o.file?.length || o.selectedBytes || 0, totalBlocks: o.total, sha256: o.sha,
     expectedSoftware: o.expectedSoftware || '', oldSoftware: o.oldSoftware, pieceMode: o.pieceMode,
+    entry: o.entry || {},
     progress: o.progress, locked: link.otaLock, connected: link.connected, device: link.name,
     visibility: document.visibilityState, writeMode: lastTransport?.writeMode || 'unknown' };
 }
@@ -189,19 +190,29 @@ function otaBegin() {
   otaBlocksList = otaBlocks(o.file);
   otaPiece = o.pieceMode === 'auto' ? 0 : Number(o.pieceMode);
   link.otaLock = true;
-  otaSet({ phase: 'asking', retry: false, message: 'Asking the box for its firmware file name…', block: 0, total: otaBlocksList.length, oldSoftware: state.version.software || '', progress: {} });
+  otaSet({ phase: 'asking', retry: false, message: 'Asking the box for its firmware file name…', block: 0, total: otaBlocksList.length, oldSoftware: state.version.software || '', progress: {}, entry: {} });
   otaLog(`start: ${otaBlocksList.length} blocks, piece size ${otaPiece || 'whole block'}; file ${o.fileName}, bytes ${o.file.length}, sha256 ${o.sha}; ${navigator.userAgent}; visibility ${document.visibilityState}; write ${lastTransport?.writeMode || 'unknown'}`);
   link.send(FIRMWARE_NAME_QUERY, { ota: true });
   otaArm(5000, () => otaFail('The box did not answer the file-name query. No update request was sent.'));
 }
 
-/** Step 2: send <0E…>; the box resets into its bootloader and answers <14>. */
+/** Step 2: request update entry. Only <14> confirms the bootloader is ready. */
 function otaEnterBootloader() {
   link.otaLock = true;
-  otaSet({ phase: 'entering', message: 'Box is restarting into update mode…' });
+  const payload = otaLengthPayload(state.ota.file.length);
+  otaSet({ phase: 'entering', entry: { ...state.ota.entry, payload, requestedAt: new Date().toISOString() },
+    message: 'Update mode requested. Waiting for the controller’s <14> ready reply; no firmware blocks sent yet.' });
   otaAcquireWake();
-  link.send(otaLengthPayload(state.ota.file.length), { ota: true });
-  otaArm(20000, () => otaFail('No <14> from the box within 20 s. It may still be running its normal firmware: switch the ignition off and on, reconnect and check the version.', 'stalled'));
+  otaLog(`requesting update mode with <${payload}>; waiting for <14> before block 1`);
+  link.send(payload, { ota: true });
+  otaArm(20000, otaEntryTimeout);
+}
+
+function otaEntryTimeout() {
+  const entry = state.ota.entry || {};
+  const result = entry.writtenAt ? 'The Bluetooth write completed locally; controller acceptance is unconfirmed.'
+    : 'Local completion of the update-request write was not recorded.';
+  otaFail(`Update mode was not confirmed: no <14> within 20 s. No firmware blocks were attempted. ${result} Save the report. Changing block piece size does not affect this stage.`, 'stalled');
 }
 
 /** After the last block: give the bootloader time to finish, then ask the new firmware for its version. */
@@ -252,7 +263,7 @@ function otaOnFrame(f) {
   }
   if (['entering', 'waiting', 'retrying'].includes(o.phase) && f.type === 'otaStart') {
     otaClearTimer(); otaLog('<14> bootloader ready');
-    otaSet({ phase: 'sending', message: 'Sending firmware blocks…' });
+    otaSet({ phase: 'sending', entry: { ...o.entry, readyAt: new Date().toISOString() }, message: 'Sending firmware blocks…' });
     otaTransfer.start(otaBlocksList, otaPiece);
     otaAcquireWake();
     return true;
@@ -294,15 +305,13 @@ function otaRetry() {
   otaPiece = o.pieceMode === 'auto' ? 0 : Number(o.pieceMode);
   if (state.demo && lastTransport && o.check.info.embeddedName) lastTransport.otaName = o.check.info.embeddedName;
   link.otaLock = true;
-  otaSet({ phase: 'retrying', retry: true, block: 0, progress: {}, message: 'Retrying from the start: asking the box for its file name…' });
+  otaSet({ phase: 'retrying', retry: true, block: 0, progress: {}, entry: {}, message: 'Retrying from the start: asking the box for its file name…' });
   otaAcquireWake();
   otaLog('retry from the start');
   link.send(FIRMWARE_NAME_QUERY, { ota: true });
   otaArm(4000, () => {
-    otaLog('no answer to <0DBB44>: the box is probably waiting in update mode, sending the update request again');
-    otaSet({ phase: 'entering', message: 'No answer, so the box is probably in update mode. Sending the update request again…' });
-    link.send(otaLengthPayload(o.file.length), { ota: true });
-    otaArm(20000, () => otaFail('Still no <14>. Power-cycle the box again (main power connector or its fuse, about a minute), reconnect, and retry. Copy the Bluetooth log.', 'stalled'));
+    otaLog('no filename reply; controller state is unknown. Explicit retry requests update mode again');
+    otaEnterBootloader();
   });
 }
 
@@ -381,6 +390,16 @@ function addLog(kind, text, note = '') {
 link.addEventListener('tx', (e) => {
   if (state.ota.phase === 'verifying' && e.detail.payload === '0A01') otaSet({ verificationQuerySent: true });
   addLog('tx', `<${e.detail.payload}>`);
+});
+link.addEventListener('command-result', (e) => {
+  const { payload, ok, error } = e.detail;
+  const o = state.ota;
+  if (payload !== o.entry?.payload || !['entering', 'sending'].includes(o.phase)) return;
+  // <14> may arrive before the GATT promise resolves. Preserve that observation
+  // and never replace the block-transfer timer with an entry timer here.
+  otaSet({ entry: { ...o.entry, writeCompleted: ok, ...(ok ? { writtenAt: new Date().toISOString() } : { writeError: error }) } });
+  otaLog(`update-request Bluetooth write ${ok ? 'completed locally (not a controller acknowledgement)' : `failed: ${error}`}`);
+  if (!ok && o.phase === 'entering') otaFail(`Update-request Bluetooth write failed: ${error}. No firmware blocks were attempted. Controller state is unknown; save the report.`, 'stalled');
 });
 link.addEventListener('error', (e) => { addLog('err', e.detail.message); toast(e.detail.message); });
 link.addEventListener('frame', (e) => {
@@ -1429,7 +1448,8 @@ function buildDevice() {
     h('p', { class: 'hint' }, '1. Get the file (e.g. File122.bin) onto this phone. The app cannot download it: the vendor server blocks browsers, and the app makes no network requests. 2. Pick it below; the app checks it. 3. The app asks the box for its file name and refuses if it does not match the file.'),
     otaInput, otaFileInfo, h('div', { class: 'field' }, h('label', {}, 'Block writes'), otaPieceSel), otaSetup, otaProgress, otaMsg, otaRetryBtn, otaWaitBtn, otaStopBtn,
     h('details', { style: { 'margin-top': '8px' } }, h('summary', {}, 'If it stops'),
-      h('p', { class: 'hint' }, 'The vendor’s recovery procedure: switch the car off, cut the control box’s main power for about a minute (unplug its power connector, or pull the fuse it is wired to), reconnect power, reconnect in this app, and tap “Retry from the start”. The app asks the box for its name. If the normal firmware answers, the update runs again from the beginning. If the box stays silent (waiting in update mode), the app sends the update request directly. Try 100- or 20-byte pieces if it stalls at the very start. Copy the Bluetooth log and keep it.'),
+      h('p', { class: 'hint' }, 'If no <14> arrives and the block count stays at zero, update mode was not confirmed. Block piece size has not been used yet. Save the report before retrying. A size or bootloader limitation is not established by this timeout; comparing a previously working image with this same app can help isolate it.'),
+      h('p', { class: 'hint' }, 'For an interrupted block transfer, the vendor’s recovery procedure is to switch the car off, cut the control box’s main power for about a minute (power connector or its fuse), reconnect power, reconnect in this app, and tap “Retry from the start”. The app asks for the filename, then requests update mode again. Silence alone does not establish that the bootloader is running. Copy the Bluetooth log and keep it.'),
       h('p', { class: 'hint' }, '“Wait for the box” only listens for the box asking for block 1 (<14>), without sending anything.')));
 
   // --- log + console
@@ -1518,7 +1538,9 @@ function init() {
   if (saved && (saved.locked || ['retrying', 'entering', 'sending', 'verifying', 'waiting', 'stalled'].includes(saved.phase))) {
     link.otaLock = true;
     otaSet({ phase: 'stalled', message: 'A previous update was interrupted or unverified. Re-select the firmware file, reconnect and explicitly retry from the start. The saved report is available below.',
-      fileName: saved.fileName || '', total: saved.progress?.totalBlocks || 0, progress: saved.progress || {} });
+      fileName: saved.fileName || '', selectedBytes: saved.bytes || 0, sha: saved.sha256 || '',
+      expectedSoftware: saved.expectedSoftware || '', oldSoftware: saved.oldSoftware || '', entry: saved.entry || {},
+      total: saved.totalBlocks || saved.progress?.totalBlocks || 0, progress: saved.progress || {} });
   }
   buildConnect();
   buildRgb();

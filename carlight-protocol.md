@@ -159,6 +159,8 @@ Uploader follow-up (2026-11-17): 20-byte pieces are now the default. The block s
 
 ## 8. Experimental automatic door colors/effects (File122 072 only)
 
+Hardware attempt (2026-11-17): the 234444-byte candidate's full hash matches the supplied file, but repeated `<0E234444>` attempts from running 071 time out without `<14>` and with zero block attempts. The user reports a restart/welcome animation. This is pre-transfer failure; 072 feature execution and acceptance are untested. The restart/wait flow was already present in the successful updater. Execution of exact 071 application instructions accepts this length and reaches reset with flag `55AA22DD`, with flash persistence/reset hardware intercepted. Bootloader length policy or another entry/notification failure remains unresolved. New app reports distinguish local request-write completion from controller readiness; `<14>` remains required before sending data. Private evidence: `firmware/header-analysis/hardware-tests/2026-11-17-072-entry-timeout/RESULT.md`.
+
 The prepared `261115-072` build adds a separate ten-byte command format: `7E D7 72 OP A B C D E CHECK`, where CHECK is XOR of `A5` with the first nine bytes. Commands are hex-encoded within the ordinary `<...>` framing. This is new custom firmware behavior, not a vendor opcode; neither `071` nor vendor firmware implements it. `072` is offline-verified and has not been flashed. The current confirmed hardware build remains `071`.
 
 | OP | A B C D E |

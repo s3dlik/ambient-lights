@@ -126,11 +126,17 @@ export class Link extends EventTarget {
           // Re-check at dequeue time: a normal command may have been queued before OTA locked the link.
           if (this.otaLock && !item.ota) continue;
           this.emit('tx', { payload });
+          let ok = false, error = '';
           try {
             await transport.write(encodeFrame(payload));
+            ok = current();
           } catch (e) {
-            this.emit('error', { message: `Write failed: ${e.message || e}` });
+            error = describeError(e);
+            if (current()) this.emit('error', { message: `Write failed: ${error}` });
           }
+          // A tx entry is an attempt. Report write completion separately, and
+          // discard late outcomes from a disconnected/replaced connection.
+          if (current()) this.emit('command-result', { payload, ok, error });
         }
         await new Promise((r) => setTimeout(r, this.gapMs));
       }

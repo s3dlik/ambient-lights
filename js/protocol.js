@@ -150,8 +150,10 @@ export const FIRMWARE_NAME_QUERY = '0DBB44';
 // Procedure, as implemented by the vendor app (FactoryActivity / WLSAPI, carLight 1.81.3):
 //   1. <0DBB44>                      -> box replies <15xx…name…> (plain ASCII) or <1502> = "update not supported"
 //   2. file = hex-decoded JSON "result" from the vendor server, sent byte-for-byte (header + XOR body, nothing decoded)
-//   3. <0E%06d(file length)>         -> box stores length + flag 0x55AA44BB and resets into its bootloader
-//                                       (box answers <1502> instead if the length equals the last update's length)
+//   3. <0E%06d(file length)>         -> application stores length/update flag and requests reset
+//      File122 + 0DBB44 uses 0x55AA22DD, with no traced application same-length gate.
+//      Legacy File004 uses 0x55AA44BB and rejects equal remembered lengths.
+//      Bootloader policy/limits are not known; reset alone does not confirm update mode.
 //   4. bootloader replies <14>       -> send block 0; every <16> -> next block
 //      blocks = 200 raw bytes (last one shorter), one GATT write each, write-without-response, no framing/checksum
 //   5. no completion message: the vendor app just closes its progress dialog after the last block.

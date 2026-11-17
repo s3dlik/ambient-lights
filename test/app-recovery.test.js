@@ -185,6 +185,56 @@ test('the actual app runs filename, length, block transfer and a matching post-t
   app.otaTransfer.cancel();
 });
 
+test('072 entry timeout records the completed request write and sends zero firmware bytes', async t => {
+  const app=appHarness(), sent=[];
+  app.state.ota={...app.state.ota,file:new Uint8Array(234444),fileName:'072.bin',check:{ok:true,info:{embeddedName:'File122.bin'}}};
+  app.link.gapMs=0;
+  app.link.transport={connected:true,write:async bytes=>{
+    const payload=new TextDecoder().decode(bytes); sent.push(payload);
+    if(payload==='<0DBB44>') queueMicrotask(()=>app.otaOnFrame({type:'firmwareName',name:'File122.bin'}));
+  },disconnect:async()=>{}};
+  t.after(()=>app.link.disconnect());
+  app.otaBegin();
+  for(let i=0;i<100 && !app.state.ota.entry.writtenAt;i++) await new Promise(r=>setTimeout(r,5));
+  assert.ok(app.state.ota.entry.writtenAt);
+  assert.equal(app.state.ota.phase,'entering');
+  assert.deepEqual(sent,['<0DBB44>','<0E234444>']);
+  assert.equal(app.state.ota.progress.currentBlock,undefined);
+  const timeout=[...app.timers.values()].find(timer=>timer.ms===20000);
+  assert.ok(timeout); timeout.fn();
+  assert.equal(app.state.ota.phase,'stalled');
+  assert.match(app.state.ota.message,/No firmware blocks were attempted/);
+  assert.match(app.state.ota.message,/write completed locally/);
+  assert.deepEqual(sent,['<0DBB44>','<0E234444>']);
+  assert.equal(app.diagnostics.lastUpdate.entry.payload,'0E234444');
+  assert.equal(app.link.otaLock,true);
+  const reloaded=appHarness(app.storage); reloaded.init();
+  assert.equal(reloaded.state.ota.entry.payload,'0E234444');
+  assert.equal(reloaded.state.ota.total,1173);
+  assert.equal(reloaded.state.ota.selectedBytes,234444);
+  assert.equal(reloaded.state.ota.file,null);
+  assert.equal(reloaded.link.queue.length,0);
+});
+
+test('an update-request write failure is reported before a bootloader timeout and cannot start data', async t => {
+  const app=appHarness(), sent=[];
+  app.state.ota={...app.state.ota,file:new Uint8Array(436),check:{ok:true,info:{embeddedName:'File122.bin'}}};
+  app.link.gapMs=0;
+  app.link.transport={connected:true,write:async bytes=>{
+    const payload=new TextDecoder().decode(bytes); sent.push(payload);
+    if(payload==='<0DBB44>') queueMicrotask(()=>app.otaOnFrame({type:'firmwareName',name:'File122.bin'}));
+    else throw new Error('test GATT failure');
+  },disconnect:async()=>{}};
+  t.after(()=>app.link.disconnect());
+  app.otaBegin();
+  for(let i=0;i<100 && app.state.ota.phase!=='stalled';i++) await new Promise(r=>setTimeout(r,5));
+  assert.equal(app.state.ota.phase,'stalled');
+  assert.equal(app.state.ota.entry.writeCompleted,false);
+  assert.match(app.state.ota.message,/Update-request Bluetooth write failed/);
+  app.otaOnFrame({type:'otaStart'});
+  assert.deepEqual(sent,['<0DBB44>','<0E000436>']);
+});
+
 test('door effects require a fresh 072 version on this connection, and disconnect invalidates it', () => {
   const app=appHarness(); app.buildConnect(); app.buildDevice();
   const apply=app.body.all().find(e=>e.tag==='button' && e.textContent==='Apply and enable door effects');
