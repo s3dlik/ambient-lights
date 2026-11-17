@@ -21,10 +21,13 @@ export function doorConfiguration({ effect, color, brightness, period, mapping, 
 }
 export function parseDoorReply(raw) {
   const text = String(raw).replace(/^<|>$/g, '');
-  const match = /^072 ([SCMWEN]) ([0-9A-F]+)$/.exec(text);
+  // S/X come from the compact 072 build; C/M/W/E/N only from the first 072 build.
+  const match = /^072 ([SCMWENX]) ([0-9A-F]+)$/.exec(text);
   if (!match) return null;
-  const lengths = { S: 5, C: 5, M: 4, W: 6, E: 3, N: 4 };
+  const lengths = { S: 5, C: 5, M: 4, W: 6, E: 3, N: 4, X: 1 };
   if (match[2].length !== lengths[match[1]] * 2) return null;
   return { kind: match[1], values: match[2].match(/../g).map(n => parseInt(n, 16)) };
 }
 export const DOOR_REASONS = ['Idle', 'Door effect active', 'Native lights disabled', 'Ignition is off', 'Native welcome has priority', 'A/C overlay has priority', 'Disabled', 'Preview ended'];
+/** Refusal codes in <072 X code> replies (compact 072 build). */
+export const DOOR_REFUSALS = { 1: 'wrong command length', 2: 'bad header or checksum', 3: 'unknown command' };

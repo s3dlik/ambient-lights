@@ -274,7 +274,12 @@ test('door panel applies settings in order, retains runtime status, and blocks a
   assert.deepEqual(Array.from(app.state.doorFx.replies.S),[1,3,1,1,1]);
   assert.match(app.body.querySelector('#view-device').textContent,/Door effect active/);
   app.link.otaLock=true; app.otaSet({phase:'sending'});
-  for(const label of ['Read door effect status','Preview C0','Disable custom door effects']) {
+  app.link.emit('frame',{payload:'072 X 02'});
+  assert.match(app.body.querySelector('#view-device').textContent,/Last refusal: bad header or checksum/);
+  app.link.emit('frame',{payload:'072 S 0103010101'});
+  assert.doesNotMatch(app.body.querySelector('#view-device').textContent,/Last refusal/);
+  assert.equal(button('Preview C0'),undefined);
+  for(const label of ['Read door effect status','Disable custom door effects']) {
     assert.equal(button(label).disabled,true);
     button(label).dispatchEvent(new Event('click'));
   }

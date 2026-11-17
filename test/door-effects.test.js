@@ -28,5 +28,6 @@ test('runtime replies decode only the exact 072 diagnostic formats', () => {
   assert.deepEqual(parseDoorReply('072 S 0103050101'),{kind:'S',values:[1,3,5,1,1]});
   assert.deepEqual(parseDoorReply('<072 M 78000F0F>'),{kind:'M',values:[0x78,0,15,15]});
   assert.deepEqual(parseDoorReply('072 N 00000100'),{kind:'N',values:[0,0,1,0]});
-  for (const text of ['071 IDLE','072 S 00','072 Q 0000','072 S ZZZZZZZZZZ','072 ARMED']) assert.equal(parseDoorReply(text),null);
+  assert.deepEqual(parseDoorReply('<072 X 03>'),{kind:'X',values:[3]});
+  for (const text of ['071 IDLE','072 S 00','072 Q 0000','072 S ZZZZZZZZZZ','072 ARMED','072 X 0303']) assert.equal(parseDoorReply(text),null);
 });

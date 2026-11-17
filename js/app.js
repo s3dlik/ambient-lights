@@ -6,7 +6,7 @@ import {
 import { Link, WebBluetoothTransport, DemoTransport, describeError } from './transport.js';
 import { OtaTransfer } from './ota-transfer.js';
 import { DiagnosticLog } from './diagnostics.js';
-import { DOOR_EFFECTS, DOOR_REASONS, doorCommand, doorConfiguration, parseDoorReply } from './door-effects.js';
+import { DOOR_EFFECTS, DOOR_REASONS, DOOR_REFUSALS, doorCommand, doorConfiguration, parseDoorReply } from './door-effects.js';
 
 // ---------------------------------------------------------------------------
 // tiny DOM + state helpers
@@ -406,7 +406,11 @@ link.addEventListener('frame', (e) => {
   const f = parseFrame(e.detail.payload);
   const doorReply = parseDoorReply(e.detail.payload);
   if (f.type === 'version') set({ doorFx: { ...state.doorFx, verifiedConnection: f.software === '261115-072' } });
-  if (doorReply) set({ doorFx: { ...state.doorFx, replies: { ...state.doorFx.replies, [doorReply.kind]: doorReply.values } } });
+  if (doorReply) {
+    const replies = { ...state.doorFx.replies, [doorReply.kind]: doorReply.values };
+    if (doorReply.kind === 'S') delete replies.X; // an accepted command supersedes an earlier refusal
+    set({ doorFx: { ...state.doorFx, replies } });
+  }
   // during a firmware update log only every 50th <16>, so the start of the log (the interesting part) survives
   const quietAck = f.type === 'otaNext' && state.ota.phase === 'sending' && (state.ota.block + 1) % 50 !== 0;
   if (!quietAck) addLog('rx', `<${e.detail.payload}>`, f.type);
@@ -1136,15 +1140,15 @@ function buildDoorEffects() {
   }, true);
   const read = button('Read door effect status', () => sendDoor(doorCommand(2)));
   const stop = button('Disable custom door effects', () => sendDoor(doorCommand(0)));
-  const preview = h('div', { class: 'row' }, ...[0, 1, 2, 3].map(i => button(`Preview C${i}`, () => sendDoor(doorCommand(5, [1 << i, 10])))));
   const status = h('p', { class: 'hint' });
   bind(() => {
     const supported = state.doorFx.verifiedConnection && state.version.software === '261115-072';
     actions.forEach(b => { b.disabled = !supported || !state.connected || link.otaLock; });
-    const s = state.doorFx.replies.S;
+    const s = state.doorFx.replies.S, x = state.doorFx.replies.X;
     status.textContent = !supported ? 'Requires the experimental 261115-072 firmware. These controls do not operate on 071 or vendor firmware.'
       : s ? `Last read: ${s[0] ? 'Enabled' : 'Disabled'} · ignition value ${s[1]} · door bits ${s[2].toString(16).toUpperCase()} · active channels ${s[3].toString(16).toUpperCase()} · ${DOOR_REASONS[s[4]] || 'Unknown state'}`
         : 'Read status to check the controller. Settings are disabled after a controller restart until you apply them again.';
+    if (supported && x) status.textContent += ` · Last refusal: ${DOOR_REFUSALS[x[0]] || `code ${x[0]}`}`;
   });
   return detailsCard('Custom door colors and effects (072)', status,
     h('p', { class: 'hint' }, 'Experimental: configure while parked. Native welcome and A/C overlays have priority. The provisional door mapping and receiver priority still need checking on the car. Settings stay in controller RAM until its next restart; preferences are saved on this phone. This version does not add a leaving animation.'),
@@ -1153,9 +1157,9 @@ function buildDoorEffects() {
     h('div', { class: 'field' }, h('label', {}, 'Brightness limit (%) — also follows native dimming'), brightness),
     h('div', { class: 'field' }, h('label', {}, 'Effect cycle'), period),
     h('details', {}, h('summary', {}, 'Map doors and animation direction'),
-      h('p', { class: 'hint' }, 'Preview one channel at a time to identify its physical door. Open one door and read status to identify its signal bit (1, 2, 4, or 8). Assign each of the four signals once; the default mapping is provisional.'), ...mappingRows),
-    apply, read, preview, stop,
-    h('p', { class: 'hint' }, 'Preview uses the last settings applied to the controller and lasts 10 seconds. Disable ends automatic effects and previews. After closing a door, the controller sends a flat native-color hand-back while normal animation packets continue; exact receiver restoration still needs verification.'));
+      h('p', { class: 'hint' }, 'To identify a channel, tick only that channel, apply, and open doors one at a time to see which strip lights. Open one door and read status to identify its signal bit (1, 2, 4, or 8). Assign each of the four signals once; the default mapping is provisional.'), ...mappingRows),
+    apply, read, stop,
+    h('p', { class: 'hint' }, 'Disable ends automatic effects. After closing a door, the controller sends a flat native-color hand-back while normal animation packets continue; exact receiver restoration still needs verification.'));
 }
 function renderLog() {
   if (!logPre || logPre.closest('details')?.open === false) return;
