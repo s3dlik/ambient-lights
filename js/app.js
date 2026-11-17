@@ -101,6 +101,38 @@ function send(payload, key) {
 }
 
 // ---------------------------------------------------------------------------
+// custom door colour / open-door effect (custom firmware 261115-072/074/075)
+// Settings live in controller RAM only, so the phone keeps them and re-sends
+// them every time it connects to a box running the door firmware.
+// ---------------------------------------------------------------------------
+
+const DOOR_DEFAULTS = { on: false, effect: 0, color: '#00ff80', brightness: 60, period: 15, mapping: [0, 2, 3, 1], reverse: 0, enabled: 15 };
+const doorReady = () => state.connected && state.doorFx.verifiedConnection && isDoorFirmware(state.version.software) && !link.otaLock;
+function doorPrefs() {
+  const prefs = { ...DOOR_DEFAULTS, ...state.doorFx.preferences };
+  try { doorConfiguration(prefs); return prefs; } catch { return { ...DOOR_DEFAULTS, on: prefs.on === true }; }
+}
+/** Send the saved door settings: the full configuration when on, Disable when off. */
+function sendDoorPrefs({ quiet = false } = {}) {
+  if (!doorReady()) { if (!quiet) toast('Needs the custom door firmware 261115-075'); return false; }
+  const prefs = doorPrefs();
+  for (const command of prefs.on ? doorConfiguration(prefs) : [doorCommand(0)]) if (!send(command)) return false;
+  return true;
+}
+let doorTimer = null;
+/** Save door settings on the phone; send them when the effect is on (or was just switched). */
+function setDoorPrefs(patch, { debounce = false } = {}) {
+  const prefs = { ...doorPrefs(), ...patch };
+  doorConfiguration(prefs); // throws on invalid values
+  store.set('doorEffects072', prefs);
+  set({ doorFx: { ...state.doorFx, preferences: prefs } });
+  if (!prefs.on && !('on' in patch)) return;
+  clearTimeout(doorTimer);
+  if (debounce) doorTimer = setTimeout(() => sendDoorPrefs(), 400);
+  else sendDoorPrefs();
+}
+
+// ---------------------------------------------------------------------------
 // firmware update (OTA): same procedure as the vendor app, see protocol.js
 // ---------------------------------------------------------------------------
 
@@ -405,7 +437,12 @@ link.addEventListener('error', (e) => { addLog('err', e.detail.message); toast(e
 link.addEventListener('frame', (e) => {
   const f = parseFrame(e.detail.payload);
   const doorReply = parseDoorReply(e.detail.payload);
-  if (f.type === 'version') set({ doorFx: { ...state.doorFx, verifiedConnection: isDoorFirmware(f.software) } });
+  if (f.type === 'version') {
+    const verified = isDoorFirmware(f.software);
+    set({ doorFx: { ...state.doorFx, verifiedConnection: verified } });
+    // the box forgets door settings on every restart: re-send the saved ones
+    if (verified && doorPrefs().on) setTimeout(() => sendDoorPrefs({ quiet: true }), 500);
+  }
   if (doorReply) {
     const replies = { ...state.doorFx.replies, [doorReply.kind]: doorReply.values };
     if (doorReply.kind === 'S') delete replies.X; // an accepted command supersedes an earlier refusal
@@ -885,6 +922,39 @@ function buildLight() {
   );
 }
 
+function doorLightCard() {
+  const status = h('p', { class: 'hint' });
+  const picker = h('input', { type: 'color', class: 'input', style: { height: '44px', padding: '4px' }, 'aria-label': 'Any door colour', onchange: () => setDoorPrefs({ color: picker.value.toLowerCase() }) });
+  const body = h('div', {},
+    h('div', { class: 'toggle-line' },
+      h('div', {}, h('div', {}, 'Custom open-door light'), h('div', { class: 'hint', style: { margin: '2px 0 0' } }, 'Replaces the normal door warning while a door is open')),
+      seg([[true, 'ON'], [false, 'OFF']], () => doorPrefs().on, (on) => setDoorPrefs({ on }))),
+    h('h3', {}, 'Door colour'),
+    swatchGrid(PALETTE, () => PALETTE.indexOf(doorPrefs().color), (i) => setDoorPrefs({ color: PALETTE[i] })),
+    h('div', { class: 'field', style: { 'margin-top': '10px' } }, h('label', {}, 'Any colour'), picker),
+    h('h3', {}, 'Effect when a door is open'),
+    seg(DOOR_EFFECTS.map((label, i) => [i, label]), () => doorPrefs().effect, (effect) => setDoorPrefs({ effect }), { cols: 3 }),
+    h('h3', {}, 'Speed'),
+    seg([[5, 'Fast'], [15, 'Normal'], [30, 'Slow']], () => doorPrefs().period, (period) => setDoorPrefs({ period })),
+    slider('Brightness', 1, 10, () => Math.max(1, Math.round(doorPrefs().brightness / 10)), (x) => setDoorPrefs({ brightness: x * 10 }, { debounce: true })),
+    h('p', { class: 'hint' }, 'Works while the ignition is on. Saved on this phone and sent again every time you connect. Which strip belongs to which door can be changed under Device › Custom door effects (advanced).'));
+  bind(() => {
+    const prefs = doorPrefs();
+    if (document.activeElement !== picker) picker.value = prefs.color;
+    const supported = state.doorFx.verifiedConnection && isDoorFirmware(state.version.software);
+    body.hidden = !supported;
+    const s = state.doorFx.replies.S;
+    status.textContent = !supported ? 'Needs the custom door firmware 261115-075 (Device › Firmware update).'
+      : !prefs.on ? 'Off: doors show the normal warning.'
+        : !s ? 'On: settings sent.'
+          : s[4] === 1 ? 'On: a door effect is showing now.'
+            : s[4] === 0 ? 'On and ready: open a door.'
+              : s[4] === 6 ? 'On: settings not confirmed yet, switch it OFF and ON again.'
+                : `On, waiting: ${DOOR_REASONS[s[4]] || 'unknown state'}.`;
+  });
+  return card('Doors', 'custom firmware', status, body);
+}
+
 function buildCar() {
   const v = $('#view-car');
   const syncBtn = h('button', { class: 'btn small', type: 'button', onclick: () => { send(Cmd.welcomeColorSyncRgb()); set({ welcomeColor: 'sync' }); } }, 'Use RGB colour');
@@ -916,6 +986,7 @@ function buildCar() {
       h('h3', {}, 'Turn signal'), swatchGrid(WARN_COLORS, () => state.turnColor, (i) => { send(Cmd.turnColor(i)); set({ turnColor: i }); }, { cols: 4 }),
       h('h3', {}, 'Blind spot'), swatchGrid(WARN_COLORS.slice(0, 2), () => state.blindColor, (i) => { send(Cmd.blindColor(i)); set({ blindColor: i }); }, { cols: 4 }),
       h('p', { class: 'hint' }, 'The box doesn’t report these back, so nothing is highlighted until you pick one.')),
+    doorLightCard(),
     card('Welcome light', 'when you unlock / open',
       seg([[true, 'ON'], [false, 'OFF']], () => state.welcome, (on) => { send(Cmd.welcome(on)); set({ welcome: on }); }),
       h('h3', {}, 'Animation'),
@@ -1101,9 +1172,7 @@ function buildLab() {
 let logPre, logCard, otaCard, offlineTools, deviceTools;
 
 function buildDoorEffects() {
-  const defaults = { effect: 0, color: '#00ff80', brightness: 60, period: 15, mapping: [0, 2, 3, 1], reverse: 0, enabled: 15 };
-  let prefs = { ...defaults, ...state.doorFx.preferences };
-  try { doorConfiguration(prefs); } catch { prefs = defaults; }
+  const prefs = doorPrefs();
   const color = h('input', { type: 'color', class: 'input', value: prefs.color, 'aria-label': 'Door warning color' });
   const effect = h('select', { class: 'input' }, ...DOOR_EFFECTS.map((label, i) => h('option', { value: String(i) }, label)));
   effect.value = String(prefs.effect);
@@ -1121,7 +1190,7 @@ function buildDoorEffects() {
   });
   const actions = [];
   const sendDoor = payload => {
-    if (!state.doorFx.verifiedConnection || !isDoorFirmware(state.version.software)) { toast('This control requires a fresh 261115-072 or -074 firmware reply'); return false; }
+    if (!state.doorFx.verifiedConnection || !isDoorFirmware(state.version.software)) { toast('This control requires a fresh 261115-072, -074 or -075 firmware reply'); return false; }
     return send(payload);
   };
   const button = (label, fn, primary = false) => {
@@ -1134,23 +1203,28 @@ function buildDoorEffects() {
         enabled: enables.reduce((n, c, i) => n | (c.checked ? 1 << i : 0), 0) };
       const commands = doorConfiguration(config);
       for (const command of commands) if (!sendDoor(command)) return;
-      state.doorFx.preferences = config; store.set('doorEffects072', config);
+      const saved = { ...config, on: true };
+      store.set('doorEffects072', saved); set({ doorFx: { ...state.doorFx, preferences: saved } });
       toast('Settings queued. Read controller status to confirm.');
     } catch (e) { toast(e.message); }
   }, true);
   const read = button('Read door effect status', () => sendDoor(doorCommand(2)));
-  const stop = button('Disable custom door effects', () => sendDoor(doorCommand(0)));
+  const stop = button('Disable custom door effects', () => {
+    if (!sendDoor(doorCommand(0))) return;
+    const saved = { ...doorPrefs(), on: false };
+    store.set('doorEffects072', saved); set({ doorFx: { ...state.doorFx, preferences: saved } });
+  });
   const status = h('p', { class: 'hint' });
   bind(() => {
     const supported = state.doorFx.verifiedConnection && isDoorFirmware(state.version.software);
     actions.forEach(b => { b.disabled = !supported || !state.connected || link.otaLock; });
     const s = state.doorFx.replies.S, x = state.doorFx.replies.X;
-    status.textContent = !supported ? 'Requires the experimental 261115-072 or 261115-074 firmware. These controls do not operate on 071 or vendor firmware.'
+    status.textContent = !supported ? 'Requires the custom 261115-072, -074 or -075 firmware. These controls do not operate on 071 or vendor firmware.'
       : s ? `Last read: ${s[0] ? 'Enabled' : 'Disabled'} · ignition value ${s[1]} · door bits ${s[2].toString(16).toUpperCase()} · active channels ${s[3].toString(16).toUpperCase()} · ${DOOR_REASONS[s[4]] || 'Unknown state'}`
         : 'Read status to check the controller. Settings are disabled after a controller restart until you apply them again.';
     if (supported && x) status.textContent += ` · Last refusal: ${DOOR_REFUSALS[x[0]] || `code ${x[0]}`}`;
   });
-  return detailsCard('Custom door colors and effects (072/074)', status,
+  return detailsCard('Custom door effects (advanced)', status,
     h('p', { class: 'hint' }, 'Experimental: configure while parked. Native welcome and A/C overlays have priority. The provisional door mapping and receiver priority still need checking on the car. Settings stay in controller RAM until its next restart; preferences are saved on this phone. This version does not add a leaving animation.'),
     h('div', { class: 'field' }, h('label', {}, 'Door warning color'), color),
     h('div', { class: 'field' }, h('label', {}, 'Effect'), effect),

@@ -33,6 +33,6 @@ test('runtime replies decode only the exact 072 diagnostic formats', () => {
 });
 
 test('door panel firmware gate accepts only 072 and 074', () => {
-  for (const v of ['261115-072','261115-074']) assert.equal(isDoorFirmware(v),true);
+  for (const v of ['261115-072','261115-074','261115-075']) assert.equal(isDoorFirmware(v),true);
   for (const v of ['261115-071','261115-073','261115-007','']) assert.equal(isDoorFirmware(v),false);
 });

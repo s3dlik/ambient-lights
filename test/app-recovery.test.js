@@ -54,7 +54,7 @@ function appHarness(storage = new Map()) {
   const source = readFileSync(new URL('../js/app.js', import.meta.url), 'utf8')
     .replace(/^import[\s\S]*?from '[^']+';\s*/gm, '')
     .replace(/\binit\(\);\s*$/, '');
-  vm.runInContext(source + '\nglobalThis.api = { state, link, diagnostics, init, buildConnect, buildDevice, renderShell, readFirmwareName, otaBegin, otaRetry, otaOnFrame, otaFail, otaStopAndUnlock, otaLoadFile, otaTransfer, otaSet };', context);
+  vm.runInContext(source + '\nglobalThis.api = { state, link, diagnostics, init, buildConnect, buildDevice, buildCar, renderShell, readFirmwareName, otaBegin, otaRetry, otaOnFrame, otaFail, otaStopAndUnlock, otaLoadFile, otaTransfer, otaSet };', context);
   return { ...context.api, document, body, storage, timers };
 }
 
@@ -286,3 +286,44 @@ test('door panel applies settings in order, retains runtime status, and blocks a
   assert.equal(writes.length,3);
   assert.equal(app.link.queue.length,0);
 });
+
+test('Car page door card re-sends saved settings on connect and switches off with Disable', {timeout:2000}, async t => {
+  const saved={on:true,effect:2,color:'#ff0000',brightness:80,period:15,mapping:[0,2,3,1],reverse:0,enabled:15};
+  const app=appHarness(new Map([['al.doorEffects072',JSON.stringify(saved)]])); app.buildConnect(); app.buildCar();
+  const light=app.body.querySelector('#view-car').all().find(e=>e.tag==='div' && e.children[0]?.tag==='h2' && e.children[0].textContent.startsWith('Doors'));
+  assert.ok(light,'Doors card is on the Car page');
+  assert.match(light.textContent,/Needs the custom door firmware 261115-075/);
+  const writes=[]; let waiting=null;
+  const until=n=>new Promise(resolve=>{ waiting={n,resolve}; if(writes.length>=n) resolve(); });
+  app.link.gapMs=0;
+  app.link.transport={connected:true,write:async bytes=>{
+    writes.push(String.fromCharCode(...bytes)); if(waiting && writes.length>=waiting.n) waiting.resolve();
+  },disconnect:async()=>{}};
+  t.after(()=>app.link.disconnect());
+  app.state.connected=true;
+  app.link.emit('frame',{payload:'13'+Buffer.from('V6.303229-B60261115-075').toString('hex').toUpperCase()});
+  assert.doesNotMatch(light.textContent,/Needs the custom door firmware/);
+  const resend=[...app.timers.values()].find(x=>x.ms===500);
+  assert.ok(resend,'saved door settings are scheduled for re-sending');
+  resend.fn();
+  await until(3);
+  assert.deepEqual(writes,doorEffects.doorConfiguration(saved).map(p=>`<${p}>`));
+  // Picking a colour while ON sends the new configuration straight away.
+  const swatch=light.all().find(e=>e.tag==='button' && e['aria-label']==='Colour 4');
+  swatch.dispatchEvent(new Event('click'));
+  await until(6);
+  assert.deepEqual(writes.slice(3),doorEffects.doorConfiguration({...saved,color:'#00ff00'}).map(p=>`<${p}>`));
+  // OFF sends Disable once and remembers it; colour changes while OFF are only saved.
+  const off=light.all().filter(e=>e.tag==='button' && e.textContent==='OFF').at(-1);
+  off.dispatchEvent(new Event('click'));
+  await until(7);
+  assert.equal(writes[6],`<${doorEffects.doorCommand(0)}>`);
+  assert.equal(JSON.parse(app.storage.get('al.doorEffects072')).on,false);
+  light.all().find(e=>e.tag==='button' && e['aria-label']==='Colour 1').dispatchEvent(new Event('click'));
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(writes.length,7);
+  assert.equal(JSON.parse(app.storage.get('al.doorEffects072')).color,'#ff0000');
+  app.link.emit('frame',{payload:'072 S 0003000000'});
+  assert.match(light.textContent,/Off: doors show the normal warning/);
+});
+

@@ -1,6 +1,6 @@
 // Protocol for the opt-in File122 072 firmware. No writes occur in this module.
-/** Custom firmware versions that implement this door-effects protocol (072 compact, 074 stream mode). */
-export const DOOR_FIRMWARE = ['261115-072', '261115-074'];
+/** Custom firmware versions that implement this door-effects protocol (072 compact, 074/075 stream mode). */
+export const DOOR_FIRMWARE = ['261115-072', '261115-074', '261115-075'];
 export const isDoorFirmware = software => DOOR_FIRMWARE.includes(software);
 export const DOOR_EFFECTS = ['Solid', 'Blink', 'Pulse', 'Repeating wipe', 'Comet'];
 const byte = (n, max = 255) => {
@@ -31,6 +31,6 @@ export function parseDoorReply(raw) {
   if (match[2].length !== lengths[match[1]] * 2) return null;
   return { kind: match[1], values: match[2].match(/../g).map(n => parseInt(n, 16)) };
 }
-export const DOOR_REASONS = ['Idle', 'Door effect active', 'Native lights disabled', 'Ignition is off', 'Native welcome has priority', 'A/C overlay has priority', 'Disabled', 'Preview ended'];
+export const DOOR_REASONS = ['Idle', 'Door effect active', 'Native lights disabled', 'Ignition is off', 'Lights are off or fading', 'A/C overlay has priority', 'Disabled', 'Preview ended'];
 /** Refusal codes in <072 X code> replies (compact 072 build). */
 export const DOOR_REFUSALS = { 1: 'wrong command length', 2: 'bad header or checksum', 3: 'unknown command' };
