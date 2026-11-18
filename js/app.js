@@ -130,7 +130,7 @@ function doorPrefs() {
 function sendDoorPrefs({ quiet = false } = {}) {
   if (!doorReady()) { if (!quiet && !state.demo) toast('Needs the custom door firmware 261115-077'); return false; }
   const prefs = doorPrefs();
-  const commands = prefs.on ? doorConfiguration(prefs) : [doorCommand(0)];
+  const commands = prefs.on ? doorConfiguration({ ...prefs, effect: prefs.effect < doorEffectCount() ? prefs.effect : 0 }) : [doorCommand(0)];
   if (hasGoodbye(state.version.software)) commands.push(goodbyeCommand(prefs.goodbye === true, prefs.goodbyeTime, prefs.goodbyeSignal));
   for (const command of commands) if (!send(command)) return false;
   return true;
@@ -940,8 +940,12 @@ function buildLight() {
   );
 }
 
+// 077 had to drop Repeating wipe and Comet to fit the bootloader size limit; their codes show Solid.
+const doorEffectCount = () => (savesInBox(state.version.software) || state.demo ? 3 : DOOR_EFFECTS.length);
+
 function doorLightCard() {
   const status = h('p', { class: 'hint' });
+  const effectSeg = seg(DOOR_EFFECTS.map((label, i) => [i, label]), () => doorPrefs().effect, (effect) => setDoorPrefs({ effect }), { cols: 3 });
   const picker = h('input', { type: 'color', class: 'input', style: { height: '44px', padding: '4px' }, 'aria-label': 'Any door colour', onchange: () => setDoorPrefs({ color: picker.value.toLowerCase() }) });
   const body = h('div', {},
     h('div', { class: 'toggle-line' },
@@ -951,7 +955,7 @@ function doorLightCard() {
     swatchGrid(PALETTE, () => PALETTE.indexOf(doorPrefs().color), (i) => setDoorPrefs({ color: PALETTE[i] })),
     h('div', { class: 'field', style: { 'margin-top': '10px' } }, h('label', {}, 'Any colour'), picker),
     h('h3', {}, 'Effect when a door is open'),
-    seg(DOOR_EFFECTS.map((label, i) => [i, label]), () => doorPrefs().effect, (effect) => setDoorPrefs({ effect }), { cols: 3 }),
+    effectSeg,
     h('h3', {}, 'Speed'),
     seg([[5, 'Fast'], [15, 'Normal'], [30, 'Slow']], () => doorPrefs().period, (period) => setDoorPrefs({ period })),
     slider('Brightness', 1, 10, () => Math.max(1, Math.round(doorPrefs().brightness / 10)), (x) => setDoorPrefs({ brightness: x * 10 }, { debounce: true })),
@@ -974,6 +978,7 @@ function doorLightCard() {
     body.hidden = !supported && !state.demo;
     goodbyeBody.hidden = !hasGoodbye(state.version.software) && !state.demo;
     goodbyeMissing.hidden = hasGoodbye(state.version.software);
+    [...effectSeg.children].forEach((b, i) => { b.hidden = i >= doorEffectCount(); });
     goodbyeSignalHint.hidden = goodbyeBody.hidden || !!prefs.goodbyeSignal?.[1];
     const s = state.doorFx.replies.S;
     status.textContent = state.demo && !supported ? 'Demo: these controls need the custom door firmware 261115-077 on the real box. Nothing is sent or saved here.'
