@@ -296,7 +296,7 @@ test('Car page door card re-sends saved settings on connect and switches off wit
   assert.equal(app.storage.get('al.doorMappingFixed'),'true');
   const light=app.body.querySelector('#view-car').all().find(e=>e.tag==='div' && e.children[0]?.tag==='h2' && e.children[0].textContent.startsWith('Doors'));
   assert.ok(light,'Doors card is on the Car page');
-  assert.match(light.textContent,/Needs the custom door firmware 261115-076/);
+  assert.match(light.textContent,/Needs the custom door firmware 261115-077/);
   const writes=[]; let waiting=null;
   const until=n=>new Promise(resolve=>{ waiting={n,resolve}; if(writes.length>=n) resolve(); });
   app.link.gapMs=0;
@@ -345,7 +345,7 @@ test('Car page goodbye is sent to 076 on connect and when changed, even with the
   t.after(()=>app.link.disconnect());
   app.state.connected=true;
   app.link.emit('frame',{payload:'13'+Buffer.from('V6.303229-B60261115-076').toString('hex').toUpperCase()});
-  assert.equal(card.all().find(e=>e.textContent==='Goodbye animation: needs firmware 261115-076.').hidden,true);
+  assert.equal(card.all().find(e=>e.textContent==='Goodbye animation: needs firmware 261115-077.').hidden,true);
   const resend=[...app.timers.values()].find(x=>x.ms===500);
   assert.ok(resend,'goodbye alone is enough to re-send on connect');
   resend.fn();
@@ -366,3 +366,51 @@ test('Car page goodbye is sent to 076 on connect and when changed, even with the
   assert.equal(JSON.parse(app.storage.get('al.doorEffects072')).goodbyeTime,20);
 });
 
+
+test('demo shows the Doors controls with the 076 note but sends and saves nothing', () => {
+  const saved={on:true,effect:2,color:'#ff0000',brightness:80,period:15,mapping:[2,0,1,3],reverse:0,enabled:15,goodbye:false,goodbyeTime:10};
+  const app=appHarness(new Map([['al.doorEffects072',JSON.stringify(saved)],['al.doorMappingFixed','true']]));
+  app.state.demo=true; app.buildConnect(); app.buildCar();
+  const card=app.body.querySelector('#view-car').all().find(e=>e.tag==='div' && e.children[0]?.tag==='h2' && e.children[0].textContent.startsWith('Doors'));
+  assert.match(card.textContent,/Demo: these controls need the custom door firmware 261115-077/);
+  const hiddenUp=e=>{ for(let x=e;x&&x!==card;x=x.parentNode) if(x.hidden) return true; return false; };
+  const goodbyeOn=card.all().filter(e=>e.tag==='button' && e.textContent==='ON').at(-1);
+  assert.equal(hiddenUp(goodbyeOn),false,'goodbye controls are visible in the demo');
+  assert.equal(hiddenUp(card.all().find(e=>e['aria-label']==='Colour 4')),false,'door colours are visible in the demo');
+  assert.equal(hiddenUp(card.all().find(e=>e.textContent==='Goodbye animation: needs firmware 261115-077.')),false);
+  card.all().find(e=>e['aria-label']==='Colour 4').dispatchEvent(new Event('click'));
+  goodbyeOn.dispatchEvent(new Event('click'));
+  assert.equal(app.state.doorFx.preferences.goodbye,true);
+  assert.deepEqual(JSON.parse(app.storage.get('al.doorEffects072')),saved,'demo changes are not saved');
+  assert.equal(app.link.queue.length,0);
+});
+
+test('077 advanced card takes car-signal snapshots and sends the saved goodbye trigger', {timeout:2000}, async t => {
+  const saved={on:false,effect:0,color:'#ff0000',brightness:80,period:15,mapping:[2,0,1,3],reverse:0,enabled:15,goodbye:true,goodbyeTime:10};
+  const app=appHarness(new Map([['al.doorEffects072',JSON.stringify(saved)],['al.doorMappingFixed','true']])); app.buildConnect(); app.buildDevice();
+  const writes=[]; let waiting=null;
+  const until=n=>new Promise(resolve=>{ waiting={n,resolve}; if(writes.length>=n) resolve(); });
+  app.link.gapMs=0;
+  app.link.transport={connected:true,write:async bytes=>{
+    writes.push(String.fromCharCode(...bytes)); if(waiting && writes.length>=waiting.n) waiting.resolve();
+  },disconnect:async()=>{}};
+  t.after(()=>app.link.disconnect());
+  app.state.connected=true;
+  app.link.emit('frame',{payload:'13'+Buffer.from('V6.303229-B60261115-077').toString('hex').toUpperCase()});
+  const resend=[...app.timers.values()].find(x=>x.ms===500); resend.fn();
+  await until(2);
+  assert.deepEqual(writes,[`<${doorEffects.doorCommand(0)}>`,`<${doorEffects.goodbyeCommand(true,10,[0,0,0])}>`]);
+  const device=app.body.querySelector('#view-device');
+  const button=label=>device.all().find(e=>e.tag==='button' && e.textContent===label);
+  button('Car signal snapshot').dispatchEvent(new Event('click'));
+  await until(6);
+  assert.deepEqual(writes.slice(2),[0,1,2,3].map(n=>`<${doorEffects.snapshotCommand(n)}>`));
+  device.all().find(e=>e['aria-label']==='Signal byte').value='16';
+  device.all().find(e=>e['aria-label']==='Signal bit mask (hex)').value='04';
+  button('Save goodbye trigger').dispatchEvent(new Event('click'));
+  await until(8);
+  assert.equal(writes[7],`<${doorEffects.goodbyeCommand(true,10,[16,4,0])}>`);
+  assert.deepEqual(JSON.parse(app.storage.get('al.doorEffects072')).goodbyeSignal,[16,4,0]);
+  app.link.emit('frame',{payload:'072 D 00'+'00'.repeat(16)});
+  assert.deepEqual(app.state.doorFx.replies.D,[0,...Array(16).fill(0)]);
+});

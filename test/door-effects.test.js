@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { doorCommand, doorConfiguration, parseDoorReply, isDoorFirmware, goodbyeCommand, hasGoodbye } from '../js/door-effects.js';
+import { doorCommand, doorConfiguration, parseDoorReply, isDoorFirmware, goodbyeCommand, hasGoodbye, snapshotCommand, savesInBox } from '../js/door-effects.js';
 import { BLOCKED_PREFIXES } from '../js/protocol.js';
 
 test('072 commands are exact ten-byte frames with XOR checksum and stay outside OTA opcodes', () => {
@@ -20,7 +20,7 @@ test('072 commands are exact ten-byte frames with XOR checksum and stay outside 
 test('malformed colors, mappings, brightness and timing cannot be queued', () => {
   const valid={effect:0,color:'#00ff80',brightness:60,period:15,mapping:[0,2,3,1],reverse:0,enabled:15};
   for (const patch of [{effect:5},{color:'#123'},{brightness:101},{brightness:1.5},{period:4},{period:101},{mapping:[0,0,2,3]},{mapping:[0,1,2,4]},{enabled:0},{reverse:16}]) assert.throws(()=>doorConfiguration({...valid,...patch}));
-  assert.throws(()=>doorCommand(6));
+  assert.throws(()=>doorCommand(7));
   assert.throws(()=>doorCommand(1,[1,2,3,4,5,6]));
 });
 
@@ -43,4 +43,18 @@ test('goodbye command is op 5 with on/off and 100 ms stage time, only on 076', (
   for (const bad of [2,51,1.5]) assert.throws(()=>goodbyeCommand(true,bad));
   assert.equal(hasGoodbye('261115-076'),true);
   for (const v of ['261115-075','261115-072','']) assert.equal(hasGoodbye(v),false);
+});
+
+test('077 goodbye signal, car-state snapshot and D replies', () => {
+  assert.equal(goodbyeCommand(true,10,[16,4,1]),doorCommand(5,[1,10,16,4,1]));
+  assert.equal(goodbyeCommand(true,10),doorCommand(5,[1,10,0,0,0]));
+  for (const bad of [[64,1,0],[0,256,0],[0,1,2],[0,1]]) assert.throws(()=>goodbyeCommand(true,10,bad));
+  assert.equal(snapshotCommand(3),doorCommand(6,[3]));
+  assert.throws(()=>snapshotCommand(4));
+  const d='072 D 03'+'00112233445566778899AABBCCDDEEFF';
+  assert.deepEqual(parseDoorReply(d).values,[3,0,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff]);
+  assert.equal(parseDoorReply('072 D 0300'),null);
+  assert.equal(savesInBox('261115-077'),true);
+  assert.equal(savesInBox('261115-076'),false);
+  assert.equal(hasGoodbye('261115-077'),true);
 });
