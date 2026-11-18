@@ -6,7 +6,7 @@ import {
 import { Link, WebBluetoothTransport, DemoTransport, describeError } from './transport.js';
 import { OtaTransfer } from './ota-transfer.js';
 import { DiagnosticLog } from './diagnostics.js';
-import { DOOR_EFFECTS, DOOR_REASONS, DOOR_REFUSALS, isDoorFirmware, hasGoodbye, savesInBox, goodbyeCommand, snapshotCommand, doorCommand, doorConfiguration, parseDoorReply } from './door-effects.js';
+import { DOOR_EFFECTS, DOOR_REASONS, DOOR_REFUSALS, isDoorFirmware, hasGoodbye, savesInBox, needsGoodbyeSignal, goodbyeCommand, snapshotCommand, doorCommand, doorConfiguration, parseDoorReply } from './door-effects.js';
 
 // ---------------------------------------------------------------------------
 // tiny DOM + state helpers
@@ -128,7 +128,7 @@ function doorPrefs() {
 }
 /** Send the saved door settings: the full configuration when on, Disable when off. */
 function sendDoorPrefs({ quiet = false } = {}) {
-  if (!doorReady()) { if (!quiet && !state.demo) toast('Needs the custom door firmware 261115-077'); return false; }
+  if (!doorReady()) { if (!quiet && !state.demo) toast('Needs the custom door firmware 261115-078'); return false; }
   const prefs = doorPrefs();
   const commands = prefs.on ? doorConfiguration({ ...prefs, effect: prefs.effect < doorEffectCount() ? prefs.effect : 0 }) : [doorCommand(0)];
   if (hasGoodbye(state.version.software)) commands.push(goodbyeCommand(prefs.goodbye === true, prefs.goodbyeTime, prefs.goodbyeSignal));
@@ -910,9 +910,6 @@ function buildFlow() {
 function buildLight() {
   const v = $('#view-light');
   const labels = () => (state.frontBack ? ['Center', 'Doors', 'Footwell'] : ['All', 'Zone 1', 'Zone 2']);
-  const levelSeg = seg([1, 2, 3, 4, 5].map((n) => [n, String(n)]), () => state.nightLevel, (n) => {
-    send(Cmd.nightDim(state.nightDim ?? true, n)); set({ nightLevel: n, nightDim: state.nightDim ?? true });
-  }, { cols: 5 });
 
   v.append(
     card('Power', null,
@@ -932,8 +929,9 @@ function buildLight() {
       h('label', { class: 'check' }, bindCheckbox(() => state.nightDim, (on) => {
         send(Cmd.nightDim(on, state.nightLevel ?? 3)); set({ nightDim: on, nightLevel: state.nightLevel ?? 3 });
       }), 'Dim while driving at night'),
-      levelSeg,
-      h('p', { class: 'hint' }, 'Level 1–5 = how much to dim. The box detects night from the car (headlights / light sensor).')),
+      // The box firmware (handler for command 1A at 0x08009F5A) stores only on/off (setting 9) and ignores the
+      // level byte; the dimmed brightness comes from the car's own dashboard-brightness value (setting 0xBA, from CAN).
+      h('p', { class: 'hint' }, 'Dims the lights when the car’s headlights are on. How much it dims follows your car’s dashboard brightness (the instrument dimmer), not a level here. The box ignores the 1–5 level, so the app no longer offers it.')),
     card('Control mode', null,
       seg([[false, 'Car & phone'], [true, 'Phone only']], () => state.forcePhone, (fp) => { send(Cmd.controlMode(fp)); set({ forcePhone: fp }); }),
       h('p', { class: 'hint' }, '“Car & phone” lets the car’s own ambient-light menu change the lights too. “Phone only” keeps your settings from this app.')),
@@ -959,15 +957,15 @@ function doorLightCard() {
     h('h3', {}, 'Speed'),
     seg([[5, 'Fast'], [15, 'Normal'], [30, 'Slow']], () => doorPrefs().period, (period) => setDoorPrefs({ period })),
     slider('Brightness', 1, 10, () => Math.max(1, Math.round(doorPrefs().brightness / 10)), (x) => setDoorPrefs({ brightness: x * 10 }, { debounce: true })),
-    h('p', { class: 'hint' }, 'From firmware 261115-077 the box keeps these settings when the car is locked, and the door colour also works before you start the car. The phone keeps a copy and sends it again when you connect. Which strip belongs to which door can be changed under Device › Custom door effects (advanced).'));
+    h('p', { class: 'hint' }, 'From firmware 261115-077 the box keeps these settings when the car is locked, and the door colour also works before you start the car (from 078 also during the welcome and after the lights go off). The phone keeps a copy and sends it again when you connect. Which strip belongs to which door can be changed under Device › Custom door effects (advanced).'));
   const goodbyeBody = h('div', {},
     h('div', { class: 'toggle-line' },
-      h('div', {}, h('div', {}, 'Goodbye animation'), h('div', { class: 'hint', style: { margin: '2px 0 0' } }, 'When the ignition turns off: rear strips shrink toward the front, then the front strips toward the dash')),
+      h('div', {}, h('div', {}, 'Goodbye animation'), h('div', { class: 'hint', style: { margin: '2px 0 0' } }, 'When you switch the engine off: rear strips shrink toward the front, then the front strips, then the dash fades (078)')),
       seg([[true, 'ON'], [false, 'OFF']], () => doorPrefs().goodbye, (goodbye) => setDoorPrefs({ goodbye }))),
     h('h3', {}, 'Goodbye speed'),
     seg([[5, 'Fast'], [10, 'Normal'], [20, 'Slow']], () => doorPrefs().goodbyeTime, (goodbyeTime) => setDoorPrefs({ goodbyeTime })),
     h('p', { class: 'hint' }, 'Only runs if the lights were on. Afterwards the strips stay dark until you open a door. If a strip shrinks toward the back, tick "reverse" for it under Device › Custom door effects (advanced).'));
-  const goodbyeMissing = h('p', { class: 'hint' }, 'Goodbye animation: needs firmware 261115-077.');
+  const goodbyeMissing = h('p', { class: 'hint' }, 'Goodbye animation: needs firmware 261115-078.');
   const goodbyeSignalHint = h('p', { class: 'hint' }, 'The car reports the ignition as on until a door opens, so the goodbye needs an engine-off signal. Set it once under Device › Custom door effects (advanced) › Goodbye trigger.');
   body.append(h('h3', {}, 'Goodbye'), goodbyeBody, goodbyeSignalHint, goodbyeMissing);
   bind(() => {
@@ -979,10 +977,10 @@ function doorLightCard() {
     goodbyeBody.hidden = !hasGoodbye(state.version.software) && !state.demo;
     goodbyeMissing.hidden = hasGoodbye(state.version.software);
     [...effectSeg.children].forEach((b, i) => { b.hidden = i >= doorEffectCount(); });
-    goodbyeSignalHint.hidden = goodbyeBody.hidden || !!prefs.goodbyeSignal?.[1];
+    goodbyeSignalHint.hidden = !needsGoodbyeSignal(state.version.software) || !!prefs.goodbyeSignal?.[1];
     const s = state.doorFx.replies.S;
-    status.textContent = state.demo && !supported ? 'Demo: these controls need the custom door firmware 261115-077 on the real box. Nothing is sent or saved here.'
-      : !supported ? 'Needs the custom door firmware 261115-077 (Device › Firmware update).'
+    status.textContent = state.demo && !supported ? 'Demo: these controls need the custom door firmware 261115-078 on the real box. Nothing is sent or saved here.'
+      : !supported ? 'Needs the custom door firmware 261115-078 (Device › Firmware update).'
       : !prefs.on ? 'Off: doors show the normal warning.'
         : !s ? 'On: settings sent.'
           : s[4] === 1 ? 'On: a door effect is showing now.'
@@ -1228,7 +1226,7 @@ function buildDoorEffects() {
   });
   const actions = [];
   const sendDoor = payload => {
-    if (!state.doorFx.verifiedConnection || !isDoorFirmware(state.version.software)) { toast('This control requires a fresh 261115-072 or -074 to -077 firmware reply'); return false; }
+    if (!state.doorFx.verifiedConnection || !isDoorFirmware(state.version.software)) { toast('This control requires a fresh 261115-072 or -074 to -078 firmware reply'); return false; }
     return send(payload);
   };
   const button = (label, fn, primary = false) => {
@@ -1259,7 +1257,7 @@ function buildDoorEffects() {
   const maskIn = h('input', { type: 'text', class: 'input', value: sigMask.toString(16).toUpperCase().padStart(2, '0'), 'aria-label': 'Signal bit mask (hex)' });
   const invertIn = h('input', { type: 'checkbox', checked: !!sigInvert });
   const snapshot = button('Car signal snapshot', () => {
-    if (!savesInBox(state.version.software)) { toast('Snapshots need firmware 261115-077'); return; }
+    if (!needsGoodbyeSignal(state.version.software)) { toast('Snapshots exist only in firmware 261115-077 (078 has the engine-off rule built in)'); return; }
     for (let chunk = 0; chunk < 4; chunk++) if (!sendDoor(snapshotCommand(chunk))) return;
     toast('Snapshot requested: four "072 D" lines appear in the Bluetooth log');
   });
@@ -1274,9 +1272,9 @@ function buildDoorEffects() {
   bind(() => {
     const supported = state.doorFx.verifiedConnection && isDoorFirmware(state.version.software);
     actions.forEach(b => { b.disabled = !supported || !state.connected || link.otaLock; });
-    snapshot.disabled = snapshot.disabled || !savesInBox(state.version.software);
+    snapshot.disabled = snapshot.disabled || !needsGoodbyeSignal(state.version.software);
     const s = state.doorFx.replies.S, x = state.doorFx.replies.X;
-    status.textContent = !supported ? 'Requires the custom 261115-072 or -074 to -077 firmware. These controls do not operate on 071 or vendor firmware.'
+    status.textContent = !supported ? 'Requires the custom 261115-072 or -074 to -078 firmware. These controls do not operate on 071 or vendor firmware.'
       : s ? `Last read: ${s[0] ? 'Enabled' : 'Disabled'} · ignition value ${s[1]} · door bits ${s[2].toString(16).toUpperCase()} · active channels ${s[3].toString(16).toUpperCase()} · ${DOOR_REASONS[s[4]] || 'Unknown state'}`
         : 'Read status to check the controller.';
     if (supported && x) status.textContent += ` · Last refusal: ${DOOR_REFUSALS[x[0]] || `code ${x[0]}`}`;
@@ -1291,7 +1289,7 @@ function buildDoorEffects() {
       h('p', { class: 'hint' }, 'The default order was measured on the car: C0 rear left, C1 front left, C2 front right, C3 rear right. To check a channel, tick only that channel, apply, and open doors one at a time. Open one door and read status to see its signal bit (1, 2, 4, or 8). Assign each of the four signals once.'), ...mappingRows),
     apply, read, stop,
     h('details', {}, h('summary', {}, 'Goodbye trigger (engine-off signal)'),
-      h('p', { class: 'hint' }, 'The box sees the ignition as on until a door opens, so the goodbye needs a car signal that changes when the engine stops. With the engine running tap Car signal snapshot, then turn the engine off (doors closed) and tap it again, and send the Bluetooth log. Firmware 261115-077 only.'),
+      h('p', { class: 'hint' }, 'Firmware 261115-077 only (078 uses the engine speed by itself). The box sees the ignition as on until a door opens, so 077 needs a car signal that changes when the engine stops: byte 15, mask FF on this car (engine speed).'),
       snapshot,
       h('div', { class: 'field' }, h('label', {}, 'Signal byte (0-63)'), offsetIn),
       h('div', { class: 'field' }, h('label', {}, 'Bit mask (hex, 00 = use the ignition)'), maskIn),
