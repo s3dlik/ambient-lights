@@ -128,7 +128,7 @@ function doorPrefs() {
 }
 /** Send the saved door settings: the full configuration when on, Disable when off. */
 function sendDoorPrefs({ quiet = false } = {}) {
-  if (!doorReady()) { if (!quiet && !state.demo) toast('Needs the custom door firmware 261115-078'); return false; }
+  if (!doorReady()) { if (!quiet && !state.demo) toast('Needs the custom door firmware 261115-079'); return false; }
   const prefs = doorPrefs();
   const commands = prefs.on ? doorConfiguration({ ...prefs, effect: prefs.effect < doorEffectCount() ? prefs.effect : 0 }) : [doorCommand(0)];
   if (hasGoodbye(state.version.software)) commands.push(goodbyeCommand(prefs.goodbye === true, prefs.goodbyeTime, prefs.goodbyeSignal));
@@ -964,8 +964,8 @@ function doorLightCard() {
       seg([[true, 'ON'], [false, 'OFF']], () => doorPrefs().goodbye, (goodbye) => setDoorPrefs({ goodbye }))),
     h('h3', {}, 'Goodbye speed'),
     seg([[5, 'Fast'], [10, 'Normal'], [20, 'Slow']], () => doorPrefs().goodbyeTime, (goodbyeTime) => setDoorPrefs({ goodbyeTime })),
-    h('p', { class: 'hint' }, 'Only runs if the lights were on. Afterwards the strips stay dark until you open a door. If a strip shrinks toward the back, tick "reverse" for it under Device › Custom door effects (advanced).'));
-  const goodbyeMissing = h('p', { class: 'hint' }, 'Goodbye animation: needs firmware 261115-078.');
+    h('p', { class: 'hint' }, 'Only runs if the lights were on. Afterwards the strips stay dark until you start the engine again; an opened door shows your door colour (079). If a strip shrinks toward the back, tick "reverse" for it under Device › Custom door effects (advanced).'));
+  const goodbyeMissing = h('p', { class: 'hint' }, 'Goodbye animation: needs firmware 261115-079.');
   const goodbyeSignalHint = h('p', { class: 'hint' }, 'The car reports the ignition as on until a door opens, so the goodbye needs an engine-off signal. Set it once under Device › Custom door effects (advanced) › Goodbye trigger.');
   body.append(h('h3', {}, 'Goodbye'), goodbyeBody, goodbyeSignalHint, goodbyeMissing);
   bind(() => {
@@ -979,8 +979,8 @@ function doorLightCard() {
     [...effectSeg.children].forEach((b, i) => { b.hidden = i >= doorEffectCount(); });
     goodbyeSignalHint.hidden = !needsGoodbyeSignal(state.version.software) || !!prefs.goodbyeSignal?.[1];
     const s = state.doorFx.replies.S;
-    status.textContent = state.demo && !supported ? 'Demo: these controls need the custom door firmware 261115-078 on the real box. Nothing is sent or saved here.'
-      : !supported ? 'Needs the custom door firmware 261115-078 (Device › Firmware update).'
+    status.textContent = state.demo && !supported ? 'Demo: these controls need the custom door firmware 261115-079 on the real box. Nothing is sent or saved here.'
+      : !supported ? 'Needs the custom door firmware 261115-079 (Device › Firmware update).'
       : !prefs.on ? 'Off: doors show the normal warning.'
         : !s ? 'On: settings sent.'
           : s[4] === 1 ? 'On: a door effect is showing now.'
@@ -1226,7 +1226,7 @@ function buildDoorEffects() {
   });
   const actions = [];
   const sendDoor = payload => {
-    if (!state.doorFx.verifiedConnection || !isDoorFirmware(state.version.software)) { toast('This control requires a fresh 261115-072 or -074 to -078 firmware reply'); return false; }
+    if (!state.doorFx.verifiedConnection || !isDoorFirmware(state.version.software)) { toast('This control requires a fresh 261115-072 or -074 to -079 firmware reply'); return false; }
     return send(payload);
   };
   const button = (label, fn, primary = false) => {
@@ -1274,7 +1274,7 @@ function buildDoorEffects() {
     actions.forEach(b => { b.disabled = !supported || !state.connected || link.otaLock; });
     snapshot.disabled = snapshot.disabled || !needsGoodbyeSignal(state.version.software);
     const s = state.doorFx.replies.S, x = state.doorFx.replies.X;
-    status.textContent = !supported ? 'Requires the custom 261115-072 or -074 to -078 firmware. These controls do not operate on 071 or vendor firmware.'
+    status.textContent = !supported ? 'Requires the custom 261115-072 or -074 to -079 firmware. These controls do not operate on 071 or vendor firmware. From 079 all four channels always take part (the per-channel checkboxes are ignored).'
       : s ? `Last read: ${s[0] ? 'Enabled' : 'Disabled'} · ignition value ${s[1]} · door bits ${s[2].toString(16).toUpperCase()} · active channels ${s[3].toString(16).toUpperCase()} · ${DOOR_REASONS[s[4]] || 'Unknown state'}`
         : 'Read status to check the controller.';
     if (supported && x) status.textContent += ` · Last refusal: ${DOOR_REFUSALS[x[0]] || `code ${x[0]}`}`;
