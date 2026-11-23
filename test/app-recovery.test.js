@@ -296,7 +296,7 @@ test('Car page door card re-sends saved settings on connect and switches off wit
   assert.equal(app.storage.get('al.doorMappingFixed'),'true');
   const light=app.body.querySelector('#view-car').all().find(e=>e.tag==='div' && e.children[0]?.tag==='h2' && e.children[0].textContent.startsWith('Doors'));
   assert.ok(light,'Doors card is on the Car page');
-  assert.match(light.textContent,/Needs the custom door firmware 261115-079/);
+  assert.match(light.textContent,/Needs the custom door firmware 261115-080/);
   const writes=[]; let waiting=null;
   const until=n=>new Promise(resolve=>{ waiting={n,resolve}; if(writes.length>=n) resolve(); });
   app.link.gapMs=0;
@@ -345,7 +345,7 @@ test('Car page goodbye is sent to 076 on connect and when changed, even with the
   t.after(()=>app.link.disconnect());
   app.state.connected=true;
   app.link.emit('frame',{payload:'13'+Buffer.from('V6.303229-B60261115-076').toString('hex').toUpperCase()});
-  assert.equal(card.all().find(e=>e.textContent==='Goodbye animation: needs firmware 261115-079.').hidden,true);
+  assert.equal(card.all().find(e=>e.textContent==='Goodbye animation: needs firmware 261115-080.').hidden,true);
   const resend=[...app.timers.values()].find(x=>x.ms===500);
   assert.ok(resend,'goodbye alone is enough to re-send on connect');
   resend.fn();
@@ -372,12 +372,12 @@ test('demo shows the Doors controls with the 076 note but sends and saves nothin
   const app=appHarness(new Map([['al.doorEffects072',JSON.stringify(saved)],['al.doorMappingFixed','true']]));
   app.state.demo=true; app.buildConnect(); app.buildCar();
   const card=app.body.querySelector('#view-car').all().find(e=>e.tag==='div' && e.children[0]?.tag==='h2' && e.children[0].textContent.startsWith('Doors'));
-  assert.match(card.textContent,/Demo: these controls need the custom door firmware 261115-079/);
+  assert.match(card.textContent,/Demo: these controls need the custom door firmware 261115-080/);
   const hiddenUp=e=>{ for(let x=e;x&&x!==card;x=x.parentNode) if(x.hidden) return true; return false; };
   const goodbyeOn=card.all().filter(e=>e.tag==='button' && e.textContent==='ON').at(-1);
   assert.equal(hiddenUp(goodbyeOn),false,'goodbye controls are visible in the demo');
   assert.equal(hiddenUp(card.all().find(e=>e['aria-label']==='Colour 4')),false,'door colours are visible in the demo');
-  assert.equal(hiddenUp(card.all().find(e=>e.textContent==='Goodbye animation: needs firmware 261115-079.')),false);
+  assert.equal(hiddenUp(card.all().find(e=>e.textContent==='Goodbye animation: needs firmware 261115-080.')),false);
   card.all().find(e=>e['aria-label']==='Colour 4').dispatchEvent(new Event('click'));
   goodbyeOn.dispatchEvent(new Event('click'));
   assert.equal(app.state.doorFx.preferences.goodbye,true);

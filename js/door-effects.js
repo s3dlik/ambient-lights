@@ -1,16 +1,21 @@
 // Protocol for the opt-in File122 072 firmware. No writes occur in this module.
-/** Custom firmware versions that implement this door-effects protocol (072 compact, 074-077 stream mode). */
-export const DOOR_FIRMWARE = ['261115-072', '261115-074', '261115-075', '261115-076', '261115-077', '261115-078', '261115-079'];
-export const isDoorFirmware = software => DOOR_FIRMWARE.includes(software);
-/** Versions with the ignition-off goodbye (op 5). */
-export const GOODBYE_FIRMWARE = ['261115-076', '261115-077', '261115-078', '261115-079'];
-export const hasGoodbye = software => GOODBYE_FIRMWARE.includes(software);
-/** 077+: settings saved in the box (and only Solid/Blink/Pulse fit). */
-export const SAVING_FIRMWARE = ['261115-077', '261115-078', '261115-079'];
-export const savesInBox = software => SAVING_FIRMWARE.includes(software);
+/**
+ * Custom build number of a software reply such as '261115-080' -> 80 (null for vendor or other builds).
+ * Version checks are ranges so a newer custom build keeps working without an app update
+ * (080 was flashed while the published app still listed builds only up to 079).
+ */
+const customBuild = software => {
+  const match = /^261115-(\d{3})$/.exec(software ?? '');
+  return match ? Number(match[1]) : null;
+};
+/** Door-effects protocol: 072 (compact) and 074 onwards (stream mode). 071 and 073 do not speak it. */
+export const isDoorFirmware = software => { const n = customBuild(software); return n === 72 || n >= 74; };
+/** Goodbye when the engine stops (op 5): 076 onwards. */
+export const hasGoodbye = software => customBuild(software) >= 76;
+/** 077 onwards: settings saved in the box (and only Solid/Blink/Pulse fit). */
+export const savesInBox = software => customBuild(software) >= 77;
 /** 077 only: car-signal snapshot (op 6) and a settable goodbye trigger. 078 has the RPM rule built in. */
-export const SIGNAL_FIRMWARE = ['261115-077'];
-export const needsGoodbyeSignal = software => SIGNAL_FIRMWARE.includes(software);
+export const needsGoodbyeSignal = software => customBuild(software) === 77;
 /**
  * op 5: goodbye on/off, time per stage (rear strips, then front) in 100 ms steps, and the engine-off
  * signal [byte offset 0..63 in the box's car state, bit mask, invert]. Mask 0 = ignition rule

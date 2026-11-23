@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { doorCommand, doorConfiguration, parseDoorReply, isDoorFirmware, goodbyeCommand, hasGoodbye, snapshotCommand, savesInBox } from '../js/door-effects.js';
+import { doorCommand, doorConfiguration, parseDoorReply, isDoorFirmware, goodbyeCommand, hasGoodbye, snapshotCommand, savesInBox, needsGoodbyeSignal } from '../js/door-effects.js';
 import { BLOCKED_PREFIXES } from '../js/protocol.js';
 
 test('072 commands are exact ten-byte frames with XOR checksum and stay outside OTA opcodes', () => {
@@ -32,9 +32,12 @@ test('runtime replies decode only the exact 072 diagnostic formats', () => {
   for (const text of ['071 IDLE','072 S 00','072 Q 0000','072 S ZZZZZZZZZZ','072 ARMED','072 X 0303']) assert.equal(parseDoorReply(text),null);
 });
 
-test('door panel firmware gate accepts only 072 and 074', () => {
-  for (const v of ['261115-072','261115-074','261115-075','261115-076']) assert.equal(isDoorFirmware(v),true);
-  for (const v of ['261115-071','261115-073','261115-007','']) assert.equal(isDoorFirmware(v),false);
+test('door panel firmware gate accepts 072 and every custom build from 074 on, including future ones', () => {
+  for (const v of ['261115-072','261115-074','261115-075','261115-076','261115-080','261115-081','261115-120']) assert.equal(isDoorFirmware(v),true);
+  for (const v of ['261115-071','261115-073','261115-007','261115-80','260506-080','',undefined,null]) assert.equal(isDoorFirmware(v),false);
+  // newer builds keep the newest feature set without an app update
+  for (const v of ['261115-080','261115-081']) { assert.equal(hasGoodbye(v),true); assert.equal(savesInBox(v),true); assert.equal(needsGoodbyeSignal(v),false); }
+  assert.equal(needsGoodbyeSignal('261115-077'),true);
 });
 
 test('goodbye command is op 5 with on/off and 100 ms stage time, only on 076', () => {
