@@ -55,7 +55,9 @@ export function parseDoorReply(raw) {
   const match = /^072 ([SCMWENXD]) ([0-9A-F]+)$/.exec(text);
   if (!match) return null;
   const lengths = { S: 5, C: 5, M: 4, W: 6, E: 3, N: 4, X: 1, D: 17 };
-  if (match[2].length !== lengths[match[1]] * 2) return null;
+  // 084 adds three diagnostic bytes to S: stock light state, goodbye state, frames sent (mod 256)
+  const ok = match[2].length === lengths[match[1]] * 2 || (match[1] === 'S' && match[2].length === 16);
+  if (!ok) return null;
   return { kind: match[1], values: match[2].match(/../g).map(n => parseInt(n, 16)) };
 }
 export const DOOR_REASONS = ['Idle', 'Door effect active', 'Native lights disabled', 'Ignition is off', 'Lights are off or fading', 'A/C overlay has priority', 'Disabled', 'Preview ended'];

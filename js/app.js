@@ -1276,6 +1276,7 @@ function buildDoorEffects() {
     const s = state.doorFx.replies.S, x = state.doorFx.replies.X;
     status.textContent = !supported ? 'Requires the custom 261115-072 or -074 to -080 firmware. These controls do not operate on 071 or vendor firmware. From 079 all four channels always take part (the per-channel checkboxes are ignored).'
       : s ? `Last read: ${s[0] ? 'Enabled' : 'Disabled'} · ignition value ${s[1]} · door bits ${s[2].toString(16).toUpperCase()} · active channels ${s[3].toString(16).toUpperCase()} · ${DOOR_REASONS[s[4]] || 'Unknown state'}`
+        + (s.length >= 8 ? ` · light state ${s[5].toString(16).toUpperCase()} · goodbye ${['idle', 'armed', 'running'][s[6]] ?? s[6]} · frames sent ${s[7]}` : '')
         : 'Read status to check the controller.';
     if (supported && x) status.textContent += ` · Last refusal: ${DOOR_REFUSALS[x[0]] || `code ${x[0]}`}`;
   });

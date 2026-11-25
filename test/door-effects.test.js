@@ -26,6 +26,9 @@ test('malformed colors, mappings, brightness and timing cannot be queued', () =>
 
 test('runtime replies decode only the exact 072 diagnostic formats', () => {
   assert.deepEqual(parseDoorReply('072 S 0103050101'),{kind:'S',values:[1,3,5,1,1]});
+  // 084: light state, goodbye state and frames sent follow
+  assert.deepEqual(parseDoorReply('<072 S 0101010104040005>'),{kind:'S',values:[1,1,1,1,4,4,0,5]});
+  for (const text of ['072 S 01010101040400','072 S 010101010404000500']) assert.equal(parseDoorReply(text),null);
   assert.deepEqual(parseDoorReply('<072 M 78000F0F>'),{kind:'M',values:[0x78,0,15,15]});
   assert.deepEqual(parseDoorReply('072 N 00000100'),{kind:'N',values:[0,0,1,0]});
   assert.deepEqual(parseDoorReply('<072 X 03>'),{kind:'X',values:[3]});
