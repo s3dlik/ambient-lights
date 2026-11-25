@@ -6,7 +6,7 @@ import {
 import { Link, WebBluetoothTransport, DemoTransport, describeError } from './transport.js';
 import { OtaTransfer } from './ota-transfer.js';
 import { DiagnosticLog } from './diagnostics.js';
-import { DOOR_EFFECTS, DOOR_REASONS, DOOR_REFUSALS, isDoorFirmware, hasGoodbye, savesInBox, needsGoodbyeSignal, goodbyeCommand, snapshotCommand, doorCommand, doorConfiguration, parseDoorReply } from './door-effects.js';
+import { DOOR_EFFECTS, DOOR_REASONS, DOOR_REFUSALS, isDoorFirmware, hasGoodbye, stepsAsideAfterDrive, savesInBox, needsGoodbyeSignal, goodbyeCommand, snapshotCommand, doorCommand, doorConfiguration, parseDoorReply } from './door-effects.js';
 
 // ---------------------------------------------------------------------------
 // tiny DOM + state helpers
@@ -976,6 +976,9 @@ function doorLightCard() {
     body.hidden = !supported && !state.demo;
     goodbyeBody.hidden = !hasGoodbye(state.version.software) && !state.demo;
     goodbyeMissing.hidden = hasGoodbye(state.version.software);
+    goodbyeMissing.textContent = stepsAsideAfterDrive(state.version.software)
+      ? 'No goodbye from 261115-085: once you switch the engine off, the car controls the strips. Door colours come back when the engine runs again, or after you lock and unlock.'
+      : 'Goodbye animation: needs firmware 261115-080.';
     [...effectSeg.children].forEach((b, i) => { b.hidden = i >= doorEffectCount(); });
     goodbyeSignalHint.hidden = !needsGoodbyeSignal(state.version.software) || !!prefs.goodbyeSignal?.[1];
     const s = state.doorFx.replies.S;
@@ -1276,7 +1279,9 @@ function buildDoorEffects() {
     const s = state.doorFx.replies.S, x = state.doorFx.replies.X;
     status.textContent = !supported ? 'Requires the custom 261115-072 or -074 to -080 firmware. These controls do not operate on 071 or vendor firmware. From 079 all four channels always take part (the per-channel checkboxes are ignored).'
       : s ? `Last read: ${s[0] ? 'Enabled' : 'Disabled'} · ignition value ${s[1]} · door bits ${s[2].toString(16).toUpperCase()} · active channels ${s[3].toString(16).toUpperCase()} · ${DOOR_REASONS[s[4]] || 'Unknown state'}`
-        + (s.length >= 8 ? ` · light state ${s[5].toString(16).toUpperCase()} · goodbye ${['idle', 'armed', 'running'][s[6]] ?? s[6]} · frames sent ${s[7]}` : '')
+        + (s.length >= 8 ? ` · light state ${s[5].toString(16).toUpperCase()} · ${stepsAsideAfterDrive(state.version.software)
+          ? `drive ${['engine not run yet', 'engine running', 'switched off, car in control'][s[6]] ?? s[6]}`
+          : `goodbye ${['idle', 'armed', 'running'][s[6]] ?? s[6]}`} · ${stepsAsideAfterDrive(state.version.software) ? 'frames queued' : 'queue attempts'} ${s[7]}` : '')
         : 'Read status to check the controller.';
     if (supported && x) status.textContent += ` · Last refusal: ${DOOR_REFUSALS[x[0]] || `code ${x[0]}`}`;
   });

@@ -48,6 +48,8 @@ test('goodbye command is op 5 with on/off and 100 ms stage time, only on 076', (
   assert.equal(goodbyeCommand(false,5),doorCommand(5,[0,5]));
   for (const bad of [2,51,1.5]) assert.throws(()=>goodbyeCommand(true,bad));
   assert.equal(hasGoodbye('261115-076'),true);
+  assert.equal(hasGoodbye('261115-084'),true);
+  for (const v of ['261115-085','261115-086']) { assert.equal(hasGoodbye(v),false); assert.equal(isDoorFirmware(v),true); assert.equal(savesInBox(v),true); }
   for (const v of ['261115-075','261115-072','']) assert.equal(hasGoodbye(v),false);
 });
 

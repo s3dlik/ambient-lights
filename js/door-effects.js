@@ -10,8 +10,10 @@ const customBuild = software => {
 };
 /** Door-effects protocol: 072 (compact) and 074 onwards (stream mode). 071 and 073 do not speak it. */
 export const isDoorFirmware = software => { const n = customBuild(software); return n === 72 || n >= 74; };
-/** Goodbye when the engine stops (op 5): 076 onwards. */
-export const hasGoodbye = software => customBuild(software) >= 76;
+/** Goodbye when the engine stops (op 5): 076 to 084. 085 removed it. */
+export const hasGoodbye = software => { const n = customBuild(software); return n >= 76 && n < 85; };
+/** 085 onwards: no goodbye; after the engine stops the car controls the strips until it runs again. */
+export const stepsAsideAfterDrive = software => customBuild(software) >= 85;
 /** 077 onwards: settings saved in the box (and only Solid/Blink/Pulse fit). */
 export const savesInBox = software => customBuild(software) >= 77;
 /** 077 only: car-signal snapshot (op 6) and a settable goodbye trigger. 078 has the RPM rule built in. */
